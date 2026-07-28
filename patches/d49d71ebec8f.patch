@@ -1,0 +1,39 @@
+From d49d71ebec8f03eee2514304279a05a4952fadf7 Mon Sep 17 00:00:00 2001
+From: Milo Chen <cmh79479@gmail.com>
+Date: Wed, 24 Jun 2026 14:09:09 +0800
+Subject: [PATCH] thunderbolt: xdomain: Notify peers after enumeration
+
+Service drivers may register local XDomain properties while discovery is
+still in progress. This can cause the properties changed notification to be
+sent before the peer is ready to act on it.
+
+If the peer has already read the local property block before the service
+was registered, it may keep using the old property generation and miss the
+newly registered service. With ThunderboltIP this can leave the network
+service half-discovered after a warm reboot and the login request
+eventually times out.
+
+Queue another properties changed notification after the XDomain reaches
+ENUMERATED so the peer can re-read the final local properties.
+
+Signed-off-by: Milo Chen <cmh79479@gmail.com>
+Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+---
+ drivers/thunderbolt/xdomain.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/thunderbolt/xdomain.c b/drivers/thunderbolt/xdomain.c
+index 05442df0e99c..c179bd751fe4 100644
+--- a/drivers/thunderbolt/xdomain.c
++++ b/drivers/thunderbolt/xdomain.c
+@@ -1814,6 +1814,7 @@ static void tb_xdomain_state_work(struct work_struct *work)
+ 			tb_xdomain_failed(xd);
+ 		} else {
+ 			xd->state = XDOMAIN_STATE_ENUMERATED;
++			tb_xdomain_queue_properties_changed(xd);
+ 		}
+ 		break;
+ 
+-- 
+2.43.0
+

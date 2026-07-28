@@ -1,0 +1,274 @@
+From 8b25bb5412752f44f0121a333db54558328cb1be Mon Sep 17 00:00:00 2001
+From: faliye <faliye@example.com>
+Date: Mon, 20 Jul 2026 10:23:42 +0000
+Subject: [PATCH] thunderbolt: nhi: re-kick TX ring doorbell on missed producer
+ update
+
+Symptom:
+Over a thunderbolt-net (tbnet) link between two hosts, a small but
+persistent fraction of request/response round trips (0.5~1.7% in
+testing, higher under additional driver load) stall for exactly the
+TCP minimum RTO (~200ms) before completing, even though the frame in
+question reached the peer's NIC with a correct checksum and the peer
+had already ACKed it. `nstat` on both ends confirms every stall is a
+spurious retransmission (matching TCPDSACKRecv counts): no packet is
+actually lost.
+
+Root cause:
+When `tb_ring_tx()`/`ring_write_descriptors()` posts a TX descriptor it
+signals the controller by writing the new producer index to the ring's
+doorbell register (`ring_iowrite_prod()`). On the ASMedia ASM4242 USB4
+host router, this doorbell write is occasionally not acted upon: the
+descriptor sits fully posted (RING_DESC_POSTED, valid producer index)
+but the controller's internal consumer pointer never advances to claim
+it, so `tbnet_tx_callback()` is never invoked for that frame.
+
+The frame is not lost -- it is released as soon as *any* later
+doorbell write with a different producer value occurs. For interactive
+request/response traffic there may be nothing else to send until the
+peer's stack, having received no reply, retransmits after its RTO. That
+retransmission triggers the peer to send a fresh ACK/DSACK, driving a
+new local descriptor and therefore a new (different-valued) doorbell
+write, which is exactly what frees the originally stuck frame. Bulk
+transfers rarely hit this because the ring stays busy enough that the
+next real doorbell write arrives well under 200ms; it becomes visible
+almost exclusively on latency-sensitive request/response patterns
+(observed while running llama.cpp's RPC backend across two hosts
+joined by Thunderbolt).
+
+Confirmed with a kprobe on `tb_ring_tx()`/`tbnet_tx_callback()`
+measuring time-in-ring per frame: stalled frames sit for 200-300ms
+(matching the request-level stalls almost 1:1), against a normal
+steady-state residency under 1ms.
+
+Also confirmed the doorbell is edge-triggered on *value change*, not
+level-sensitive: a timer that re-wrote the *same* producer index every
+500us while a frame was stuck fired several hundred times across a
+single stall with no effect. Only a write that changes the register
+value unwedges the ring.
+
+Fix:
+Add a per-TX-ring hrtimer, armed whenever `ring_write_descriptors()`
+leaves descriptors posted, that polls the ring's hardware consumer
+index (read-only half of the same doorbell register) every 500us. If
+the consumer index is observed frozen for two consecutive polls while
+a producer update is still outstanding, the timer briefly rewrites the
+producer register to the parked consumer value and immediately back to
+the real producer value. Both writes only ever describe descriptors
+the hardware has already been told about, so unlike a naive "kick"
+this cannot expose descriptors the hardware doesn't yet own -- an
+earlier version of this fix that stepped the producer back by one
+slot unconditionally did exactly that on an idle-then-resumed ring and
+tripped an IOMMU page fault (AMD-Vi IO_PAGE_FAULT) when the hardware
+walked past the actually-posted descriptors. The frozen-consumer check
+avoids ever touching a ring that is still making forward progress.
+
+The per-ring timer state is kept in a small static side table rather
+than as a new field on `struct tb_ring` / `struct tb_nhi`, so this
+does not change either struct's layout or the module's exported symbol
+CRCs.
+
+The workaround is unconditional (not gated behind a controller quirk)
+since it is a no-op whenever the hardware behaves correctly: the
+"frozen consumer for 2 polls" condition should never trigger on a
+controller that reliably actioned the original doorbell write. This
+was only observed on ASMedia ASM4242 (USB4/TB4, PCI id 1b21:2425); it
+has not been characterized on Intel Thunderbolt/USB4 controllers.
+Gating it behind a vendor quirk (as nhi_check_quirks() already does
+for QUIRK_AUTO_CLEAR_INT/QUIRK_E2E) would be a reasonable follow-up
+once it's confirmed Intel silicon doesn't need it, to avoid adding a
+timer to controllers that never benefit from it.
+
+Testing:
+Reproduced and fixed on two hosts (AMD Ryzen 9 9950X, ASM4242 each)
+joined point-to-point over Thunderbolt 5 cabling, running a 16KB
+request/response workload over TCP on thunderbolt-net.
+
+Before fix (stock v6.17 nhi/tbnet, all other mitigations disabled --
+no TCP_QUICKACK, default rto_min, no application-level keepalive):
+0.5-1.7% of round trips stalled for ~203-471ms across five runs of
+2000-3000 requests each.
+
+After fix, same conditions, five more runs of 2000-3000 requests each
+on each host individually and both together: 0 stalls out of 15000
+requests. A kprobe on tbnet_tx_callback() confirms 0 frames observed
+resident >50ms post-fix, versus 7-10 per run pre-fix.
+
+Signed-off-by: faliye <faliye@example.com>
+Cc: Andreas Noever <andreas.noever@gmail.com>
+Cc: Mika Westerberg <westeri@kernel.org>
+Cc: Yehezkel Bernat <YehezkelShB@gmail.com>
+Cc: linux-usb@vger.kernel.org
+Cc: linux-kernel@vger.kernel.org
+---
+ drivers/thunderbolt/nhi.c | 126 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 126 insertions(+)
+
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+index f3a2264..7679a49 100644
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -231,6 +231,125 @@ static bool ring_empty(struct tb_ring *ring)
+ 	return ring->head == ring->tail;
+ }
+ 
++/*
++ * Some controllers (observed on ASMedia ASM4242) occasionally miss the
++ * producer index update for the last posted TX descriptor. The frame then
++ * sits in the ring until the next enqueue rings the doorbell again -- for
++ * request/response traffic that next enqueue is the peer's 200ms RTO
++ * retransmission. Work around it with a per-ring timer that re-writes the
++ * producer index while TX descriptors are still in flight. Kept outside
++ * struct tb_ring so the public ABI (and module CRCs) stay unchanged.
++ */
++#define RING_KICK_INTERVAL_US	500
++#define RING_KICK_MAX		64
++
++static struct ring_kick {
++	struct hrtimer timer;
++	struct tb_ring *ring;		/* NULL = slot free */
++	u16 last_cons;
++	bool stuck;
++} ring_kicks[RING_KICK_MAX];
++static DEFINE_SPINLOCK(ring_kick_lock);
++
++static struct ring_kick *ring_kick_find(struct tb_ring *ring)
++{
++	int i;
++
++	for (i = 0; i < RING_KICK_MAX; i++) {
++		if (READ_ONCE(ring_kicks[i].ring) == ring)
++			return &ring_kicks[i];
++	}
++	return NULL;
++}
++
++static enum hrtimer_restart ring_kick_timerfn(struct hrtimer *t)
++{
++	struct ring_kick *kick = container_of(t, struct ring_kick, timer);
++	struct tb_ring *ring = kick->ring;
++	enum hrtimer_restart ret = HRTIMER_NORESTART;
++	unsigned long flags;
++
++	if (!ring)
++		return HRTIMER_NORESTART;
++
++	spin_lock_irqsave(&ring->lock, flags);
++	if (ring->running && !ring_empty(ring)) {
++		u32 reg = ioread32(ring_desc_base(ring) + 8);
++		u16 cons = reg & 0xffff;
++		u16 prod = (reg >> 16) & 0xffff;
++		bool pending = prod == ring->head && cons != prod;
++
++		if (pending && kick->stuck && kick->last_cons == cons) {
++			/*
++			 * The controller has sat on posted descriptors with
++			 * a frozen consumer index for two consecutive
++			 * intervals: the missed-doorbell stall. Re-writing
++			 * the same producer value is a no-op (it only reacts
++			 * to a value change), so briefly step the producer
++			 * back to the parked consumer index and restore it.
++			 * Both writes expose only descriptors the hardware
++			 * already owns. The frozen-consumer guard keeps this
++			 * away from a live ring, where a transient backward
++			 * producer would expose the whole ring of unposted
++			 * descriptors (observed as AMD-Vi IO_PAGE_FAULT).
++			 */
++			ring_iowrite_prod(ring, cons);
++			/* two distinct change events, not one coalesced */
++			ioread32(ring_desc_base(ring) + 8);
++			ring_iowrite_prod(ring, ring->head);
++			kick->stuck = false;
++		} else {
++			kick->stuck = pending;
++			kick->last_cons = cons;
++		}
++		hrtimer_forward_now(t, us_to_ktime(RING_KICK_INTERVAL_US));
++		ret = HRTIMER_RESTART;
++	} else {
++		kick->stuck = false;
++	}
++	spin_unlock_irqrestore(&ring->lock, flags);
++	return ret;
++}
++
++/* Called without ring->lock (ring not yet published) */
++static void ring_kick_register(struct tb_ring *ring)
++{
++	int i;
++
++	spin_lock(&ring_kick_lock);
++	for (i = 0; i < RING_KICK_MAX; i++) {
++		if (!ring_kicks[i].ring) {
++			hrtimer_setup(&ring_kicks[i].timer, ring_kick_timerfn,
++				      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++			WRITE_ONCE(ring_kicks[i].ring, ring);
++			break;
++		}
++	}
++	spin_unlock(&ring_kick_lock);
++}
++
++/* Must be called without ring->lock held */
++static void ring_kick_unregister(struct tb_ring *ring, bool release)
++{
++	struct ring_kick *kick = ring_kick_find(ring);
++
++	if (!kick)
++		return;
++	hrtimer_cancel(&kick->timer);
++	if (release)
++		WRITE_ONCE(kick->ring, NULL);
++}
++
++/* ring->lock is held */
++static void ring_kick_arm(struct tb_ring *ring)
++{
++	struct ring_kick *kick = ring_kick_find(ring);
++
++	if (kick)
++		hrtimer_start(&kick->timer, us_to_ktime(RING_KICK_INTERVAL_US),
++			      HRTIMER_MODE_REL);
++}
++
+ /*
+  * ring_write_descriptors() - post frames from ring->queue to the controller
+  *
+@@ -259,6 +378,9 @@ static void ring_write_descriptors(struct tb_ring *ring)
+ 		else
+ 			ring_iowrite_cons(ring, ring->head);
+ 	}
++
++	if (ring->is_tx && !ring_empty(ring))
++		ring_kick_arm(ring);
+ }
+ 
+ /*
+@@ -613,6 +735,8 @@ static struct tb_ring *tb_ring_alloc(struct tb_nhi *nhi, u32 hop, int size,
+ 	if (!ring->descriptors)
+ 		goto err_free_ring;
+ 
++	ring_kick_register(ring);
++
+ 	if (ring_request_msix(ring, flags & RING_FLAG_NO_SUSPEND))
+ 		goto err_free_descs;
+ 
+@@ -763,6 +887,7 @@ EXPORT_SYMBOL_GPL(tb_ring_start);
+  */
+ void tb_ring_stop(struct tb_ring *ring)
+ {
++	ring_kick_unregister(ring, false);
+ 	spin_lock_irq(&ring->nhi->lock);
+ 	spin_lock(&ring->lock);
+ 	dev_dbg(&ring->nhi->pdev->dev, "stopping %s %d\n",
+@@ -808,6 +933,7 @@ EXPORT_SYMBOL_GPL(tb_ring_stop);
+  */
+ void tb_ring_free(struct tb_ring *ring)
+ {
++	ring_kick_unregister(ring, true);
+ 	spin_lock_irq(&ring->nhi->lock);
+ 	/*
+ 	 * Dissociate the ring from the NHI. This also ensures that
+-- 
+2.43.0
+

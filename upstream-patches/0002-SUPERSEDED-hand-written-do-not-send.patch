@@ -1,0 +1,95 @@
+From: faliye <faliye@example.com>
+Subject: [PATCH] thunderbolt: net: do not enable E2E flow control on the Tx ring
+
+Commit "net: thunderbolt: Enable e2e flow control in two direction" moved
+the RING_FLAG_E2E setup so that the flag is applied to the Tx ring as well
+as the Rx ring.
+
+Per the USB4 spec, when E2E flow control is *disabled* for a Transmit
+Descriptor Ring the Host Interface Adapter Layer does not require any
+credits to be available before transmitting a tunneled packet from that
+ring. Conversely, once E2E is *enabled* on the Tx ring the controller must
+obtain end-to-end credits before it may transmit.
+
+On the ASMedia ASM4242 USB4/TB3 host router (PCI id 1b21:2425) those
+credits are never delivered. The controller accepts the configuration --
+the ring OPTIONS register reads back exactly what was written, including
+RING_FLAG_E2E_FLOW_CONTROL (bit 28) and the E2E HopID field -- but no
+credit ever arrives, so the Tx ring's hardware consumer index never
+advances. The link still passes small/intermittent traffic (ICMP squeaks
+through) while any sustained transfer stops dead.
+
+Symptoms on this controller with the offending commit applied:
+
+  - bulk TCP/UDP throughput drops to 0; iperf3 reports "No route to host"
+    once the neighbour entry expires, while ping still succeeds
+  - the driver's stall-detection counters climb without bound (a
+    frozen-consumer watchdog fired ~30k times in a 10 s window)
+  - latency-sensitive request/response traffic sees a fraction of round
+    trips stall for the peer's RTO, because the parked descriptor is only
+    released once some later event pokes the ring
+
+Restricting RING_FLAG_E2E to the Rx ring restores the pre-commit behaviour
+and makes the link work again. Measured on two hosts joined point to point
+(MSI X870E/X870, onboard ASM4242, kernel 6.17):
+
+  Tx ring E2E enabled : 0 Gb/s, watchdog storm, link unusable
+  Tx ring E2E disabled: 5.13 Gb/s steady, 0 TCP retransmits, 0 stalls in
+                        9000 x 16 KB request/response round trips
+
+Rx-side E2E is kept, so hosts that do implement the credit return still
+get receive-side flow control.
+
+A follow-up could re-enable Tx-side E2E behind a controller quirk once it
+is confirmed which silicon actually implements the credit return; blanket
+enabling it regresses at least this controller.
+
+Fixes: ("net: thunderbolt: Enable e2e flow control in two direction")
+Signed-off-by: faliye <faliye@example.com>
+Cc: Andreas Noever <andreas.noever@gmail.com>
+Cc: Mika Westerberg <westeri@kernel.org>
+Cc: Yehezkel Bernat <YehezkelShB@gmail.com>
+Cc: linux-usb@vger.kernel.org
+Cc: netdev@vger.kernel.org
+---
+ drivers/net/thunderbolt/main.c | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/thunderbolt/main.c b/drivers/net/thunderbolt/main.c
+--- a/drivers/net/thunderbolt/main.c
++++ b/drivers/net/thunderbolt/main.c
+@@ -929,15 +929,18 @@ static int tbnet_open(struct net_device *dev)
+ 	struct tb_xdomain *xd = net->xd;
+ 	u16 sof_mask, eof_mask;
+ 	struct tb_ring *ring;
+-	unsigned int flags;
++	unsigned int flags, rx_flags;
+ 	int hopid;
+
+ 	netif_carrier_off(dev);
+
+ 	flags = RING_FLAG_FRAME;
+-	/* Only enable full E2E if the other end supports it too */
++	rx_flags = flags;
++	/*
++	 * Only enable full E2E if the other end supports it too. Keep it off
++	 * the Tx ring: with E2E enabled there the controller must obtain
++	 * end-to-end credits before it may transmit, and not every host
++	 * router actually delivers them (ASMedia ASM4242 never does, which
++	 * parks the Tx consumer index forever).
++	 */
+ 	if (tbnet_e2e && net->svc->prtcstns & TBNET_E2E)
+-		flags |= RING_FLAG_E2E;
++		rx_flags |= RING_FLAG_E2E;
+
+ 	ring = tb_ring_alloc_tx(xd->tb->nhi, -1, TBNET_RING_SIZE, flags);
+ 	if (!ring) {
+@@ -952,7 +955,7 @@ static int tbnet_open(struct net_device *dev)
+ 	sof_mask = BIT(TBIP_PDF_FRAME_START);
+ 	eof_mask = BIT(TBIP_PDF_FRAME_END);
+
+-	ring = tb_ring_alloc_rx(xd->tb->nhi, -1, TBNET_RING_SIZE, flags,
++	ring = tb_ring_alloc_rx(xd->tb->nhi, -1, TBNET_RING_SIZE, rx_flags,
+ 				net->tx_ring.ring->hop, sof_mask,
+ 				eof_mask, tbnet_start_poll, net);
+ 	if (!ring) {

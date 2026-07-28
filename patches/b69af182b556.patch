@@ -1,0 +1,58 @@
+From b69af182b55665f5b0ccca8ed1ed239758671354 Mon Sep 17 00:00:00 2001
+From: Gil Fine <gil.fine@linux.intel.com>
+Date: Wed, 6 May 2026 15:37:05 +0300
+Subject: [PATCH] thunderbolt: Activate path hops from source to destination
+
+Currently, path activation starts from the last hop (destination adapter)
+and iterates backwards to the first hop (source adapter). This does not
+follow the order suggested in the USB4 Connection Manager guide and could
+potentially cause issues with tunnelled protocols.
+
+Reverse the activation order to start from the first hop (source adapter)
+and end at the last hop (destination adapter), as suggested in the
+Connection Manager guide.
+Adjust the rollback in the failure path to deactivate from the first
+hop, since hops are now activated starting at the source.
+
+Fix kernel-doc accordingly.
+
+Signed-off-by: Gil Fine <gil.fine@linux.intel.com>
+Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+---
+ drivers/thunderbolt/path.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/thunderbolt/path.c b/drivers/thunderbolt/path.c
+index 0092b2ec7873..b2c322e76b8a 100644
+--- a/drivers/thunderbolt/path.c
++++ b/drivers/thunderbolt/path.c
+@@ -484,7 +484,7 @@ void tb_path_deactivate(struct tb_path *path)
+  * tb_path_activate() - activate a path
+  * @path: Path to activate
+  *
+- * Activate a path starting with the last hop and iterating backwards. The
++ * Activate a path starting with the first hop and ending on the last hop. The
+  * caller must fill path->hops before calling tb_path_activate().
+  *
+  * Return: %0 on success, negative errno otherwise.
+@@ -526,7 +526,7 @@ int tb_path_activate(struct tb_path *path)
+ 	}
+ 
+ 	/* Activate hops. */
+-	for (i = path->path_length - 1; i >= 0; i--) {
++	for (i = 0; i < path->path_length; i++) {
+ 		struct tb_regs_hop hop = { 0 };
+ 
+ 		/* If it is left active deactivate it first */
+@@ -576,7 +576,7 @@ int tb_path_activate(struct tb_path *path)
+ 		res = tb_port_write(path->hops[i].in_port, &hop, TB_CFG_HOPS,
+ 				    2 * path->hops[i].in_hop_index, 2);
+ 		if (res) {
+-			__tb_path_deactivate_hops(path, i);
++			__tb_path_deactivate_hops(path, 0);
+ 			__tb_path_deallocate_nfc(path, 0);
+ 			goto err;
+ 		}
+-- 
+2.43.0
+

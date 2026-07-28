@@ -1,0 +1,182 @@
+diff --git a/drivers/net/thunderbolt/main.c b/drivers/net/thunderbolt/main.c
+index dcaa623..234c9b4 100644
+--- a/drivers/net/thunderbolt/main.c
++++ b/drivers/net/thunderbolt/main.c
+@@ -215,6 +215,14 @@ static struct tb_property_dir *tbnet_dir;
+ 
+ static bool tbnet_e2e = true;
+ module_param_named(e2e, tbnet_e2e, bool, 0444);
++
++static unsigned int burn_out_hopids;
++module_param(burn_out_hopids, uint, 0444);
++MODULE_PARM_DESC(burn_out_hopids, "skip lowest N TX HopIDs (poisoned-hop rescue, default 0)");
++
++static int tx_ring_index = -1;
++module_param(tx_ring_index, int, 0444);
++MODULE_PARM_DESC(tx_ring_index, "force NHI TX ring index (poisoned-ring rescue, default -1 = any)");
+ MODULE_PARM_DESC(e2e, "USB4NET full end-to-end flow control (default: true)");
+ 
+ static void tbnet_fill_header(struct thunderbolt_ip_header *hdr, u64 route,
+@@ -929,14 +937,42 @@ static int tbnet_open(struct net_device *dev)
+ 	if (tbnet_e2e && net->svc->prtcstns & TBNET_E2E)
+ 		flags |= RING_FLAG_E2E;
+ 
+-	ring = tb_ring_alloc_tx(xd->tb->nhi, -1, TBNET_RING_SIZE, flags);
++	ring = tb_ring_alloc_tx(xd->tb->nhi, tx_ring_index, TBNET_RING_SIZE,
++				flags);
++	if (!ring && tx_ring_index >= 0) {
++		netdev_warn(dev, "TX ring %d busy, falling back to any\n",
++			    tx_ring_index);
++		ring = tb_ring_alloc_tx(xd->tb->nhi, -1, TBNET_RING_SIZE,
++					flags);
++	}
+ 	if (!ring) {
+ 		netdev_err(dev, "failed to allocate Tx ring\n");
+ 		return -ENOMEM;
+ 	}
+ 	net->tx_ring.ring = ring;
++	netdev_info(dev, "TX ring %d\n", ring->hop);
++
++	/*
++	 * Rescue knob for the ASM4242 poisoned-HopID wedge: burn (skip)
++	 * the lowest N output HopIDs so the TX path lands on a fresh
++	 * router hop table entry, then hand the burned ones back.
++	 */
++	if (burn_out_hopids) {
++		int burn[8], nburn = 0, i;
+ 
+-	hopid = tb_xdomain_alloc_out_hopid(xd, -1);
++		for (i = 0; i < min_t(unsigned int, burn_out_hopids, 8U); i++) {
++			int b = tb_xdomain_alloc_out_hopid(xd, -1);
++
++			if (b < 0)
++				break;
++			burn[nburn++] = b;
++		}
++		hopid = tb_xdomain_alloc_out_hopid(xd, -1);
++		for (i = 0; i < nburn; i++)
++			tb_xdomain_release_out_hopid(xd, burn[i]);
++	} else {
++		hopid = tb_xdomain_alloc_out_hopid(xd, -1);
++	}
+ 	if (hopid < 0) {
+ 		netdev_err(dev, "failed to allocate Tx HopID\n");
+ 		tb_ring_free(net->tx_ring.ring);
+@@ -944,6 +980,7 @@ static int tbnet_open(struct net_device *dev)
+ 		return hopid;
+ 	}
+ 	net->local_transmit_path = hopid;
++	netdev_info(dev, "TX HopID %d (burned %u)\n", hopid, burn_out_hopids);
+ 
+ 	sof_mask = BIT(TBIP_PDF_FRAME_START);
+ 	eof_mask = BIT(TBIP_PDF_FRAME_END);
+diff --git a/drivers/thunderbolt/dma_test.c b/drivers/thunderbolt/dma_test.c
+index 9e47a63..8728dde 100644
+--- a/drivers/thunderbolt/dma_test.c
++++ b/drivers/thunderbolt/dma_test.c
+@@ -17,7 +17,7 @@
+ #define DMA_TEST_RX_RING_SIZE		256
+ #define DMA_TEST_FRAME_SIZE		SZ_4K
+ #define DMA_TEST_DATA_PATTERN		0x0123456789abcdefLL
+-#define DMA_TEST_MAX_PACKETS		1000
++#define DMA_TEST_MAX_PACKETS		250000
+ 
+ enum dma_test_frame_pdf {
+ 	DMA_TEST_PDF_FRAME_START = 1,
+@@ -99,6 +99,7 @@ struct dma_test {
+ 	unsigned int packets_to_send;
+ 	unsigned int packets_to_receive;
+ 	unsigned int packets_sent;
++	unsigned int tx_done;
+ 	unsigned int packets_received;
+ 	unsigned int link_speed;
+ 	enum tb_link_width link_width;
+@@ -307,6 +308,11 @@ static void dma_test_tx_callback(struct tb_ring *ring, struct ring_frame *frame,
+ 			 DMA_TO_DEVICE);
+ 	kfree(tf->data);
+ 	kfree(tf);
++
++	/* sender-only mode: signal when the last frame actually left */
++	if (!canceled && ++dt->tx_done == dt->packets_to_send &&
++	    !dt->packets_to_receive)
++		complete(&dt->complete);
+ }
+ 
+ static int dma_test_submit_tx(struct dma_test *dt, size_t npackets)
+@@ -518,6 +524,7 @@ static int test_store(void *data, u64 val)
+ 		return ret;
+ 
+ 	dt->packets_sent = 0;
++	dt->tx_done = 0;
+ 	dt->packets_received = 0;
+ 	dt->crc_errors = 0;
+ 	dt->buffer_overflow_errors = 0;
+@@ -563,6 +570,8 @@ static int test_store(void *data, u64 val)
+ 	}
+ 
+ 	if (dt->packets_to_send) {
++		if (!dt->packets_to_receive)
++			reinit_completion(&dt->complete);
+ 		ret = dma_test_submit_tx(dt, dt->packets_to_send);
+ 		if (ret) {
+ 			dev_err(&svc->dev, "failed to submit transmit buffers\n");
+@@ -571,7 +580,7 @@ static int test_store(void *data, u64 val)
+ 		}
+ 	}
+ 
+-	if (dt->packets_to_receive) {
++	if (dt->packets_to_receive || dt->packets_to_send) {
+ 		ret = wait_for_completion_interruptible(&dt->complete);
+ 		if (ret) {
+ 			dt->error_code = DMA_TEST_INTERRUPTED;
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+index 7679a49..21102ac 100644
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -243,6 +243,14 @@ static bool ring_empty(struct tb_ring *ring)
+ #define RING_KICK_INTERVAL_US	500
+ #define RING_KICK_MAX		64
+ 
++/* diagnostic counters, readable via /sys/module/thunderbolt/parameters/ */
++static unsigned long kick_fires;
++module_param(kick_fires, ulong, 0444);
++MODULE_PARM_DESC(kick_fires, "ring kick timer activations while ring busy");
++static unsigned long kick_stuck_events;
++module_param(kick_stuck_events, ulong, 0444);
++MODULE_PARM_DESC(kick_stuck_events, "frozen-consumer re-kick events");
++
+ static struct ring_kick {
+ 	struct hrtimer timer;
+ 	struct tb_ring *ring;		/* NULL = slot free */
+@@ -275,6 +283,7 @@ static enum hrtimer_restart ring_kick_timerfn(struct hrtimer *t)
+ 	spin_lock_irqsave(&ring->lock, flags);
+ 	if (ring->running && !ring_empty(ring)) {
+ 		u32 reg = ioread32(ring_desc_base(ring) + 8);
++		kick_fires++;
+ 		u16 cons = reg & 0xffff;
+ 		u16 prod = (reg >> 16) & 0xffff;
+ 		bool pending = prod == ring->head && cons != prod;
+@@ -297,6 +306,7 @@ static enum hrtimer_restart ring_kick_timerfn(struct hrtimer *t)
+ 			/* two distinct change events, not one coalesced */
+ 			ioread32(ring_desc_base(ring) + 8);
+ 			ring_iowrite_prod(ring, ring->head);
++			kick_stuck_events++;
+ 			kick->stuck = false;
+ 		} else {
+ 			kick->stuck = pending;
+@@ -1151,10 +1161,14 @@ static int nhi_poweroff_noirq(struct device *dev)
+ 	return __nhi_suspend_noirq(dev, wakeup);
+ }
+ 
++static unsigned int int_throttle_us = 128;
++module_param(int_throttle_us, uint, 0444);
++MODULE_PARM_DESC(int_throttle_us, "NHI interrupt throttling in usecs (default 128, 0 disables)");
++
+ static void nhi_enable_int_throttling(struct tb_nhi *nhi)
+ {
+ 	/* Throttling is specified in 256ns increments */
+-	u32 throttle = DIV_ROUND_UP(128 * NSEC_PER_USEC, 256);
++	u32 throttle = DIV_ROUND_UP(int_throttle_us * NSEC_PER_USEC, 256);
+ 	unsigned int i;
+ 
+ 	/*

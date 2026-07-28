@@ -1,0 +1,81 @@
+From 80d5d00355d3013986b32f00dceda36c1f2a35c2 Mon Sep 17 00:00:00 2001
+From: faliye <faliye@example.com>
+Date: Thu, 23 Jul 2026 02:48:18 +0000
+Subject: [PATCH net] net: thunderbolt: do not enable E2E flow control on the
+ Tx ring
+
+Commit a8065af3346e ("net: thunderbolt: Enable end-to-end flow control
+also in transmit") started passing RING_FLAG_E2E to tb_ring_alloc_tx()
+in addition to the Rx ring.
+
+Per the USB4 spec, a Transmit Descriptor Ring with E2E flow control
+disabled does not require any credits to be available before the Host
+Interface Adapter Layer transmits a tunneled packet from it. Once E2E is
+enabled on that ring the controller must first obtain end-to-end
+credits.
+
+The ASMedia ASM4242 USB4 host router (PCI 1b21:2425) never delivers
+those credits. The controller does accept the configuration: reading the
+ring OPTIONS register back right after tb_ring_start() returns exactly
+what was written, including RING_FLAG_E2E_FLOW_CONTROL (bit 28) and the
+E2E HopID field. No credit ever arrives though, so the Tx ring's
+hardware consumer index never advances and the link carries no traffic
+at all.
+
+Measured on two hosts connected point to point, onboard ASM4242 on MSI
+X870E and X870, v6.17, stock drivers/net/thunderbolt/main.c with only
+this patch applied on top:
+
+  before: 100% packet loss to the peer; thunderbolt0 is up and the
+          XDomain handshake completes ("new host found"), but iperf3
+          fails with "No route to host" once the neighbour entry
+          expires
+  after:  0% packet loss, 0.28 ms RTT; iperf3 4.21 Gb/s one way and
+          5.17 Gb/s the other (5 runs each, stddev <= 0.02), 1
+          retransmit in 10 s
+
+An instrumented build additionally showed a frozen-Tx-consumer watchdog
+firing ~30k times in a 10 s window before this change.
+
+Rx-side E2E is left untouched, so peers that do return credits keep
+receive-side flow control.
+
+ASMedia does not look like an isolated case. The out-of-tree
+thunderbolt-ibverbs project disables native E2E on AMD NHI by default,
+noting that "Strix Halo has reproduced TX completion wedges with
+multiple native E2E rings active" -- the same failure mode, on a
+different vendor. Since the driver has no way to tell in advance which
+host router returns the credits, defaulting Tx-side E2E to off seems
+safer than adding a quirk per affected part; it can be turned back on
+for controllers that are known to implement the credit return.
+
+Fixes: a8065af3346e ("net: thunderbolt: Enable end-to-end flow control also in transmit")
+Signed-off-by: faliye <faliye@example.com>
+---
+ drivers/net/thunderbolt/main.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/thunderbolt/main.c b/drivers/net/thunderbolt/main.c
+index 02a916505..121a42a4f 100644
+--- a/drivers/net/thunderbolt/main.c
++++ b/drivers/net/thunderbolt/main.c
+@@ -930,7 +930,15 @@ static int tbnet_open(struct net_device *dev)
+ 	if (tbnet_e2e && net->svc->prtcstns & TBNET_E2E)
+ 		flags |= RING_FLAG_E2E;
+ 
+-	ring = tb_ring_alloc_tx(xd->tb->nhi, -1, TBNET_RING_SIZE, flags);
++	/*
++	 * Leave E2E off the Tx ring. Per the USB4 spec a Transmit Descriptor
++	 * Ring with E2E enabled must obtain end-to-end credits before it may
++	 * transmit, and not every host router delivers them. On ASMedia
++	 * ASM4242 the credits never arrive, which parks the Tx consumer index
++	 * forever and makes the link unusable.
++	 */
++	ring = tb_ring_alloc_tx(xd->tb->nhi, -1, TBNET_RING_SIZE,
++				RING_FLAG_FRAME);
+ 	if (!ring) {
+ 		netdev_err(dev, "failed to allocate Tx ring\n");
+ 		return -ENOMEM;
+-- 
+2.43.0
+
