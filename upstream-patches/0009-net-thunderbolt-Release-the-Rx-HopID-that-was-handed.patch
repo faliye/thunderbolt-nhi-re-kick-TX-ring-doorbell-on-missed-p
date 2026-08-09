@@ -1,0 +1,91 @@
+From a2564eb876c22f2cbf1d1a90df2c761fc72669bf Mon Sep 17 00:00:00 2001
+From: faliye <faliye@example.com>
+Date: Sun, 9 Aug 2026 00:12:01 +0000
+Subject: [PATCH] net: thunderbolt: Release the Rx HopID that was handed out on
+ mismatch
+
+tbnet_connected_work() asks for a specific input HopID and treats getting
+a different one as a failure:
+
+	ret = tb_xdomain_alloc_in_hopid(net->xd, net->remote_transmit_path);
+	if (ret != net->remote_transmit_path) {
+		netdev_err(net->dev, "failed to allocate Rx HopID\n");
+		return;
+	}
+
+That call ends in ida_alloc_range(&xd->in_hopids, hopid, local_max_hopid),
+which allocates the lowest free id at or above the one asked for. When the
+wanted HopID is already taken it does not fail - it succeeds with the next
+one - so this path returns with an id allocated and no reference to it
+left anywhere. It stays allocated for the rest of the XDomain connection.
+
+Forcing the branch by occupying the wanted HopID first shows the returned
+id is a live allocation, not an error code:
+
+  LEAKPROBE squat=8 requested=8 local_max_hopid=27
+  LEAKPROBE real alloc ret=9
+  thunderbolt-net 0-1.0 thunderbolt0: failed to allocate Rx HopID
+
+Release the id when it is not the one we wanted, matching what the error
+unwind at the end of the function already does for the expected id.
+
+Fixes: 180b0689425c ("thunderbolt: Allow multiple DMA tunnels over a single XDomain connection")
+Cc: stable@vger.kernel.org
+Signed-off-by: faliye <faliye@example.com>
+---
+These four came out of one investigation on a pair of ASMedia ASM4242
+hosts wired to each other. They touch two drivers and apply
+independently of each other, but they are ordered this way because each
+one takes away noise the next would otherwise have to be measured
+through:
+
+  1 net: thunderbolt: Release the Rx HopID that was handed out on mismatch
+  2 net: thunderbolt: Mark the connection down when bringing it up fails
+  3 thunderbolt: Report DMA path teardown failures to the caller
+  4 thunderbolt: Stop waiting on a path pending bit that never clears
+
+This one is number 1 on that list.
+
+1 and 2 fix two separate things that happen to be reached through the
+same branch, and neither needs the other - either applies on its own.
+3 and 4 do want them underneath: the warning splat that 2 removes fires
+throughout any prolonged run of link cycling, which is what 3 and 4 have
+to be measured across. 3 makes teardown failures visible to the caller at
+all; 4 is what removes the failures on this particular router, and is the
+one I am least sure of, for the reasons in its own notes.
+
+Found on an ASMedia ASM4242 host-to-host link, where the branch is
+reached on its own when the peer drops out while a connection is being
+brought up. Cycling the interface down and up 200 times over 80 minutes
+hits it 23 times across the two hosts, no fault injection involved.
+
+I am not claiming a user-visible symptom for this one. Every one of those
+23 occurrences recovered on its own, 19 to 21 seconds later, because the
+XDomain connection ends and its ida is recreated along with it, which
+also disposes of the leaked id. I could not reach the branch twice within
+one connection, so I cannot show the HopID range being exhausted either.
+
+What the patch fixes is the leak itself. The patch that follows has the
+measurable effect, and does not depend on this one - they are separate
+defects reached through the same branch, and with only that one applied
+the id this path obtained is still never released.
+---
+ drivers/net/thunderbolt/main.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/drivers/net/thunderbolt/main.c b/drivers/net/thunderbolt/main.c
+index 121a42a4f56e..985259d98208 100644
+--- a/drivers/net/thunderbolt/main.c
++++ b/drivers/net/thunderbolt/main.c
+@@ -637,6 +637,8 @@ static void tbnet_connected_work(struct work_struct *work)
+ 	ret = tb_xdomain_alloc_in_hopid(net->xd, net->remote_transmit_path);
+ 	if (ret != net->remote_transmit_path) {
+ 		netdev_err(net->dev, "failed to allocate Rx HopID\n");
++		if (ret >= 0)
++			tb_xdomain_release_in_hopid(net->xd, ret);
+ 		return;
+ 	}
+
+--
+2.43.0
+

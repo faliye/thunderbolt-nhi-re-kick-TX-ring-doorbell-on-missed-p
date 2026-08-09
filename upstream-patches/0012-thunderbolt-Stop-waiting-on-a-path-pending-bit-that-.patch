@@ -1,0 +1,195 @@
+From b825ee9ab89f8bc20e5b0af8b54a7b1bfc0540d8 Mon Sep 17 00:00:00 2001
+From: faliye <faliye@example.com>
+Date: Sun, 9 Aug 2026 00:12:01 +0000
+Subject: [PATCH] thunderbolt: Stop waiting on a path pending bit that never
+ clears
+
+__tb_path_deactivate_hop() disables a hop and then waits up to 500 ms for
+its pending bit to read back as clear. On an ASMedia ASM4242 host router
+the bit belonging to the host interface adapter latches once the DMA ring
+feeding it has wrapped around, and from then on it never clears. Every
+teardown of a host-to-host DMA tunnel spends the full 500 ms on that hop
+and gives up anyway, which on a link that is brought up and down
+repeatedly is 500 ms every time for an answer that is already known.
+
+The bit does not track anything the adapter is doing. On a path that has
+just been activated and has never carried a single frame it reads set for
+the first few seconds and then clears on its own with no traffic at all,
+and on a hop entry left behind by an earlier teardown it still reads set
+while the rest of the entry reads as zero - 129 times over a day of
+testing, against zero occurrences on any other adapter of the same
+router, which has four lane adapters, two PCIe down, two USB3 down and
+two DP in.
+
+Reading the hop config space either side of the disable write shows the
+write lands and the controller does react to it, and that pending is all
+that is left:
+
+  dw0  80000808 -> 00000808   enable cleared
+  dw1  127ff501 -> 107ff501   egress FC cleared by the controller
+                      ^ bit 28, the only bit still set
+
+Nothing reachable from the driver clears it from there. It still reads
+set after 30 s of polling (237528 config space reads), after 60 s of idle
+before the teardown is even started, and across a module unload and
+reload. The other hop of the same tunnel, the one on the lane adapter,
+drains on its first read in about 125 us.
+
+The trigger is the ring wrap rather than an amount of traffic. With the
+tbnet ring at 128 and at 256 descriptors the first frame count whose
+teardown fails moves with it:
+
+  ring 128    100 frames  0/5 fail    120 frames  5/5 fail
+  ring 256    240 frames  0/5 fail    260 frames  5/5 fail
+
+Every point is either five failures out of five or none, and the pending
+bit read back before the disable write agrees with the outcome in each of
+those 40 rounds. Traffic keeps flowing at full rate afterwards, so
+nothing is stuck behind the bit either.
+
+The connection manager already gives up when the wait times out - the
+caller only warns and carries on. So the question is not whether to wait
+it out, but whether to spend the timeout re-learning the same answer on
+every subsequent teardown. Remember it on the adapter instead: report the
+first one and skip the wait after that.
+
+This needs no vendor matching. An adapter whose pending bit behaves
+never sets the flag, and one that does not is handled whoever made it.
+
+Measured by cycling the interface down and up 200 times over 80 minutes
+between two of these hosts, from a cold boot, with no module reloads in
+between. Only the thunderbolt module differs between the two runs:
+
+                                        without      with
+    hop deactivation failed              213 / 206    1 / 1
+    wall clock per cycle                 23.4 s       22.9 s
+                                     (host A / host B)
+
+One report per adapter instead of one per teardown, and the run comes out
+110 seconds shorter over its 200 cycles. The script's own delays are
+fixed, so that difference is the timeout itself - 200 cycles at half a
+second each is the 100 seconds it should be. The report lands on the
+first teardown, which is where a latched bit shows up, not during the
+deactivate that tb_path_activate() does before programming a hop.
+
+Signed-off-by: faliye <faliye@example.com>
+---
+These four came out of one investigation on a pair of ASMedia ASM4242
+hosts wired to each other. They touch two drivers and apply
+independently of each other, but they are ordered this way because each
+one takes away noise the next would otherwise have to be measured
+through:
+
+  1 net: thunderbolt: Release the Rx HopID that was handed out on mismatch
+  2 net: thunderbolt: Mark the connection down when bringing it up fails
+  3 thunderbolt: Report DMA path teardown failures to the caller
+  4 thunderbolt: Stop waiting on a path pending bit that never clears
+
+This one is number 4 on that list.
+
+1 and 2 fix two separate things that happen to be reached through the
+same branch, and neither needs the other - either applies on its own.
+3 and 4 do want them underneath: the warning splat that 2 removes fires
+throughout any prolonged run of link cycling, which is what 3 and 4 have
+to be measured across. 3 makes teardown failures visible to the caller at
+all; 4 is what removes the failures on this particular router, and is the
+one I am least sure of, for the reasons in its own notes.
+
+Measured on two ASM4242 hosts linked to each other, hw_vendor_id 0x174c,
+hw_device_id 0x2428, NVM 200011.250708. The base is v6.17 with three
+later commits on top, which the link needs before it stays up long enough
+to measure anything across:
+
+  7e49bb89df86 ("thunderbolt: Avoid reserved fields in path config space
+                 for USB4 routers")
+  1881f2efbf7f ("Revert "net: thunderbolt: Enable end-to-end flow control
+                 also in transmit"")
+  68bf02b6b4ad ("net: thunderbolt: Tear down DMA paths before stopping the
+                 rings")
+
+plus the two thunderbolt-net patches earlier in this list.
+
+This started out as a quirk keyed on that hardware id. The one-shot form
+is better on every count I can think of, but two things about it are
+worth saying plainly.
+
+I do not have the USB4 Connection Manager guide. If the pending bit of a
+protocol adapter is vendor defined in the same way that its IFC, ISE and
+Path Credits Allocated fields are - which 7e49bb89df86 already has the CM
+keep its hands off - then not waiting on it at all would be the right fix
+and this patch is working around the symptom. Otherwise it looks like the
+router not implementing the bit, and it would be worth ASMedia confirming
+against the NVM above.
+
+I also cannot show that skipping the wait is safe. The controller of one
+of the two hosts stops answering config space entirely (probe -110, cold
+boot to recover) roughly once an hour of continuous link cycling, and it
+does that on the distribution kernel and on the unmodified base as well
+as with this patch - 13 such events in a day across every build I ran.
+That background rate is high enough that I cannot tell whether skipping
+the wait makes it worse, and I would rather say so than let the
+measurements above suggest otherwise.
+---
+ drivers/thunderbolt/path.c | 17 +++++++++++++++++
+ drivers/thunderbolt/tb.h   |  3 +++
+ 2 files changed, 20 insertions(+)
+
+diff --git a/drivers/thunderbolt/path.c b/drivers/thunderbolt/path.c
+index 81a79c78777e..0dcc3deb6f61 100644
+--- a/drivers/thunderbolt/path.c
++++ b/drivers/thunderbolt/path.c
+@@ -397,6 +397,14 @@ static int __tb_path_deactivate_hop(struct tb_port *port, int hop_index,
+ 	if (ret)
+ 		return ret;
+
++	/*
++	 * This adapter has already been seen to leave the pending bit set
++	 * for good, so there is nothing to wait for. The hop is disabled
++	 * by the write above either way, which is what the caller needs.
++	 */
++	if (port->no_drain_status)
++		return 0;
++
+ 	/* Wait until it is drained */
+ 	timeout = ktime_add_ms(ktime_get(), 500);
+ 	do {
+@@ -430,6 +438,15 @@ static int __tb_path_deactivate_hop(struct tb_port *port, int hop_index,
+ 		usleep_range(10, 20);
+ 	} while (ktime_before(ktime_get(), timeout));
+
++	/*
++	 * Some host interface adapters latch the pending bit and never
++	 * clear it again, and there is nothing the connection manager can
++	 * do about that from here. Report it once and stop spending the
++	 * timeout on this adapter on every teardown from now on.
++	 */
++	if (tb_port_is_nhi(port))
++		port->no_drain_status = true;
++
+ 	return -ETIMEDOUT;
+ }
+
+diff --git a/drivers/thunderbolt/tb.h b/drivers/thunderbolt/tb.h
+index a9a32b64fe2a..8c022d2724e9 100644
+--- a/drivers/thunderbolt/tb.h
++++ b/drivers/thunderbolt/tb.h
+@@ -273,6 +273,8 @@ struct tb_bandwidth_group {
+  * @max_bw: Maximum possible bandwidth through this adapter if set to
+  *	    non-zero.
+  * @redrive: For DP IN, if true the adapter is in redrive mode.
++ * @no_drain_status: The pending bit of this adapter's path config space
++ *		     stayed set once, so it is not waited on any more
+  *
+  * In USB4 terminology this structure represents an adapter (protocol or
+  * lane adapter).
+@@ -302,6 +304,7 @@ struct tb_port {
+ 	struct list_head group_list;
+ 	unsigned int max_bw;
+ 	bool redrive;
++	bool no_drain_status;
+ };
+
+ /**
+--
+2.43.0
+
