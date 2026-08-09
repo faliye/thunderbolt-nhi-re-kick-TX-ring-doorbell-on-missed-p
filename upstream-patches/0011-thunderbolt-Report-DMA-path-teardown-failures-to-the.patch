@@ -1,6 +1,6 @@
-From e843b23bbf313bf023363493a0777c756dfe2d38 Mon Sep 17 00:00:00 2001
+From bbcc3774ae1a3d3d52785506d650962c0f35cf3f Mon Sep 17 00:00:00 2001
 From: faliye <faliye@example.com>
-Date: Sun, 9 Aug 2026 00:12:01 +0000
+Date: Sun, 9 Aug 2026 00:16:25 +0000
 Subject: [PATCH] thunderbolt: Report DMA path teardown failures to the caller
 
 tb_disconnect_xdomain_paths() returns 0 unconditionally. Everything
@@ -68,6 +68,14 @@ throughout any prolonged run of link cycling, which is what 3 and 4 have
 to be measured across. 3 makes teardown failures visible to the caller at
 all; 4 is what removes the failures on this particular router, and is the
 one I am least sure of, for the reasons in its own notes.
+
+This widens three signatures. tb_path_deactivate() has two callers and
+both of them are the loop inside tb_tunnel_deactivate(), which now
+collects from them. tb_tunnel_deactivate() has eight other callers and
+tb_deactivate_and_free_tunnel() four, and all twelve ignore the value.
+They behaved the same before and behave the same now; the alternative I
+could see was threading a separate out-parameter down to the one caller
+that cares, which seemed worse.
 ---
  drivers/thunderbolt/path.c   | 21 +++++++++++++++------
  drivers/thunderbolt/tb.c     | 35 +++++++++++++++++++++++------------

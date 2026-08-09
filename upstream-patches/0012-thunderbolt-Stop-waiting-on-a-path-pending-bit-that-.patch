@@ -1,6 +1,6 @@
-From b825ee9ab89f8bc20e5b0af8b54a7b1bfc0540d8 Mon Sep 17 00:00:00 2001
+From 89eb715f35d2293b0228129ef549e00652e9eddd Mon Sep 17 00:00:00 2001
 From: faliye <faliye@example.com>
-Date: Sun, 9 Aug 2026 00:12:01 +0000
+Date: Sun, 9 Aug 2026 00:16:25 +0000
 Subject: [PATCH] thunderbolt: Stop waiting on a path pending bit that never
  clears
 
@@ -129,6 +129,16 @@ as with this patch - 13 such events in a day across every build I ran.
 That background rate is high enough that I cannot tell whether skipping
 the wait makes it worse, and I would rather say so than let the
 measurements above suggest otherwise.
+
+One timeout is enough to set the flag, and that is a deliberate choice
+rather than an oversight. An adapter whose bit works but whose poll
+happened to time out once would stop being waited on for the rest of that
+switch's lifetime. It does happen: over the same day the lane adapter of
+this router timed out three times against the host interface adapter's
+466, and it drained on the first read every other time. I settled on one
+because the caller already ignores the timeout, so a false positive costs
+a diagnostic that was being thrown away anyway - but it is a counter away
+from being stricter if you would rather it were.
 ---
  drivers/thunderbolt/path.c | 17 +++++++++++++++++
  drivers/thunderbolt/tb.h   |  3 +++

@@ -1,6 +1,6 @@
-From 2acb4fff52f489d5a46ac17758882c4949988181 Mon Sep 17 00:00:00 2001
+From 4fcaa609f9a5868ca92552f5464e9aa805ca8e7a Mon Sep 17 00:00:00 2001
 From: faliye <faliye@example.com>
-Date: Sun, 9 Aug 2026 00:12:01 +0000
+Date: Sun, 9 Aug 2026 00:16:25 +0000
 Subject: [PATCH] net: thunderbolt: Mark the connection down when bringing it
  up fails
 
