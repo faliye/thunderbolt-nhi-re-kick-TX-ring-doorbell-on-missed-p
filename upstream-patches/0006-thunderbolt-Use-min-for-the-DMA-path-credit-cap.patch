@@ -1,0 +1,39 @@
+From fcece0bccd18f3072110a0f2564b263258121f12 Mon Sep 17 00:00:00 2001
+From: faliye <faliye@example.com>
+Date: Fri, 7 Aug 2026 19:34:22 +0000
+Subject: [PATCH] thunderbolt: Use min() for the DMA path credit cap
+
+tb_dma_reserve_credits() caps the request against what the adapter has
+left by decrementing one credit at a time. The other arm of the same
+if() already caps with min(port->total_credits, credits); use min()
+here too.
+
+No functional change: the object code is unchanged.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: faliye <faliye@example.com>
+---
+Verified by building drivers/thunderbolt/tunnel.o with and without this
+patch (gcc 13.3.0, x86_64): objdump output is identical, a single cmovbe
+either way.
+---
+ drivers/thunderbolt/tunnel.c | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/drivers/thunderbolt/tunnel.c b/drivers/thunderbolt/tunnel.c
+index b7f32305f14a..e9214de5f3b7 100644
+--- a/drivers/thunderbolt/tunnel.c
++++ b/drivers/thunderbolt/tunnel.c
+@@ -1796,8 +1796,7 @@ static int tb_dma_reserve_credits(struct tb_path_hop *hop, unsigned int credits)
+ 		if (available < TB_MIN_DMA_CREDITS)
+ 			return -ENOSPC;
+
+-		while (credits > available)
+-			credits--;
++		credits = min(credits, available);
+
+ 		tb_port_dbg(port, "reserving %u credits for DMA path\n",
+ 			    credits);
+--
+2.43.0
+

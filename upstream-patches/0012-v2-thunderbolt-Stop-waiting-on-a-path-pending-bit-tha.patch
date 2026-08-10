@@ -1,0 +1,305 @@
+From f15727db0bcee2b79236d78100490c2d6475253a Mon Sep 17 00:00:00 2001
+From: faliye <faliye@example.com>
+Date: Sun, 9 Aug 2026 00:43:40 +0000
+Subject: [PATCH v2] thunderbolt: Stop waiting on a path pending bit that never
+ clears
+
+__tb_path_deactivate_hop() disables a hop and then waits up to 500 ms for
+its pending bit to read back as clear. On an ASMedia ASM4242 host router
+the bit belonging to the host interface adapter latches once enough
+frames have gone through the DMA ring feeding it, and from then on it
+never clears. Every teardown of a host-to-host DMA tunnel spends the
+full 500 ms on that hop and gives up anyway, which on a link that is
+brought up and down repeatedly is 500 ms every time for an answer that
+is already known.
+
+There are two regimes, and the number of frames sent decides which one
+the adapter is in. Below the threshold the bit behaves: a path that has
+just been activated and has never carried a frame reads it set, and is
+back to clear a few seconds later with no traffic at all. Above it the
+bit stops moving. On a hop entry left behind by an earlier teardown it
+still reads set while the rest of the entry reads as zero - 129 times
+over a day of testing, against zero occurrences on any other adapter of
+the same router, which has four lane adapters, two PCIe down, two USB3
+down and two DP in.
+
+Reading the hop config space either side of the disable write shows the
+write lands and the controller does react to it, and that pending is all
+that is left:
+
+  dw0  80000808 -> 00000808   enable cleared
+  dw1  127ff501 -> 107ff501   egress FC cleared by the controller
+        ^ bit 28, the only bit still set
+
+Nothing reachable from the driver clears it from there. It still reads
+set after 30 s of polling (237528 config space reads), after 60 s of idle
+before the teardown is even started, and across a module unload and
+reload. The other hop of the same tunnel, the one on the lane adapter,
+drains on its first read in about 125 us.
+
+What decides it is the ring, not an amount of traffic. With the tbnet
+ring at 128 and at 256 descriptors the first frame count whose teardown
+fails moves with it:
+
+  ring 128    100 frames  0/5 fail    120 frames  5/5 fail
+  ring 256    240 frames  0/5 fail    260 frames  5/5 fail
+
+Every point is either five failures out of five or none, and the pending
+bit read back before the disable write agrees with the outcome in each of
+those 40 rounds. Traffic keeps flowing at full rate afterwards, so
+nothing is stuck behind the bit either.
+
+I would like to say the trigger is the ring wrapping round, and for the
+256 ring the threshold does straddle 256. It does not for the 128 one:
+120 frames is already enough there, short of a full lap. So the two sizes
+show that the point moves with the ring, not that the wrap itself is what
+does it. A third size would say more than I can.
+
+The wait itself is right. USB4 v2 spec table 8-23, the path entry of a
+protocol adapter - which is what a host interface adapter is - defines
+the bit as
+
+  28  Pending Packets (PP)                                   Type: RO
+      An Adapter shall set this field to 1b when one or more packets
+      that belong to the Path are waiting to be dequeued.
+      Otherwise it shall be set to zero.
+
+word for word what table 8-22 gives for a lane adapter. So it is neither
+vendor defined - the vendor defined path fields of that same table are
+Path Credits Allocated, IFC and ISE, which the connection manager already
+leaves alone - nor writable, being read only.
+An adapter holding it at 1b with nothing queued is in breach of that
+"shall", and there is nothing the connection manager can do about it
+from here: the poll has no ending other than the timeout.
+
+The connection manager already gives up when the wait times out. So the
+question is not whether to wait it out, nor what to tell the caller, but
+whether to spend the timeout re-deriving an answer that is already known.
+Remember it on the adapter and return the same -ETIMEDOUT straight away
+next time.
+
+Nothing above this function sees any difference. On an adapter with this
+flag set the caller gets exactly what it gets today - the same error, on
+the same teardowns, with the same warning from
+__tb_path_deactivate_hops() - only without the half second in front of
+it. That is deliberate: the timeout is a true statement about this
+adapter, and suppressing it would be reintroducing lower down the thing
+that reporting it was meant to fix.
+
+Skipping it is not free, and the spec says where the cost lands. Section
+5.4.1 lets a router keep transmitting on a path while its pending bit
+reads 1b, and only requires it to stop once tTeardown - 2 us - has
+elapsed since the bit went to 0b, and to stay stopped until Valid is set
+again. On an adapter where the bit never reaches 0b, that condition is
+never met, so re-activating the path without having seen it clear is
+outside what the spec describes: a packet left over from the old path
+could still be transmitted onto the new one. The 200 cycles below each
+carried traffic and all of them completed, but a run completing is not
+the same as showing that no stale packet ever crossed, and I cannot
+show the latter.
+
+Every timeout is still reported, this one included: the function returns
+-ETIMEDOUT whether it waited for it or not, and __tb_path_deactivate_hops()
+warns on it exactly as before. The other caller of
+__tb_path_deactivate_hop() is tb_path_activate(), which discards the
+return value, so a first timeout arriving there would set the flag
+without a word. In the runs below it never did - the hop reads back
+disabled by then and the function returns early - but that is an
+observation, not something the code guarantees.
+
+This needs no vendor matching: an adapter whose pending bit behaves never
+sets the flag, so nothing changes for hardware that works, whoever made
+it. It is however limited to host interface adapters. A lane, PCIe, USB3
+or DP adapter that latched the bit the same way would still burn the
+timeout on every teardown. I scoped it that way because that is where I
+have evidence - 466 timeouts on the host interface adapter of this router
+against 3 on its lane adapter over the same day, and the lane adapter
+drained on the first read every other time - not because I know the
+others cannot do it.
+
+Everything above and below was measured on v6.17 with three later commits
+on top, without which the link does not stay up long enough to measure
+anything across it. All three are in mainline now, so on a current tree
+the base is plain mainline:
+
+  commit 7e49bb89df86 ("thunderbolt: Avoid reserved fields in path config space for USB4 routers")
+  commit 1881f2efbf7f ("Revert "net: thunderbolt: Enable end-to-end flow control also in transmit"")
+  commit 68bf02b6b4ad ("net: thunderbolt: Tear down DMA paths before stopping the rings")
+
+>>> NUMBERS BELOW ARE FROM THE RETURN-0 VERSION AND DO NOT DESCRIBE THIS
+>>> PATCH.  DO NOT SEND UNTIL THE RE-RUN REPLACES THEM.  The wall clock
+>>> row should survive unchanged; the failure count should now match the
+>>> control arm, not drop to 1/1.
+
+Measured by cycling the interface down and up 200 times over 80 minutes
+between two of these hosts, from a cold boot, with no module reloads in
+between. Only the thunderbolt module differs between the two runs:
+
+                                        without      with
+    hop deactivation failed              213 / 206    1 / 1
+    wall clock per cycle                 23.4 s       22.9 s
+                                     (host A / host B)
+
+The run comes out 110 seconds shorter over its 200 cycles - 4682 against
+4572 seconds of wall clock, which is where the per-cycle figures above
+come from. The script's own delays are fixed, so that difference is the
+timeout itself: 200 cycles at half a second each would be 100 seconds,
+and the measured 110 is that plus whatever the rest of the run varied by.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: faliye <faliye@example.com>
+---
+This came out of an investigation on a pair of ASMedia ASM4242 hosts
+wired to each other. It stands on its own: it applies to mainline
+unchanged and needs nothing else under it.
+
+Two thunderbolt-net fixes from the same investigation went to netdev
+separately:
+https://lore.kernel.org/netdev/20260809-b4-tbnet-hopid-v1-0-9a8c7f5f0ba9@gmail.com/
+
+Neither is needed for this patch to apply or to work. They matter only
+for reproducing the measurements, because without them a prolonged run of
+link cycling produces a warning splat of its own that gets in the way.
+
+Measured on two ASM4242 hosts linked to each other, hw_vendor_id 0x174c,
+hw_device_id 0x2428, NVM 200011.250708, on the base named in the commit
+message plus the two thunderbolt-net patches linked above.
+
+This started out as a quirk keyed on that hardware id, and the one-shot
+form is better on every count I can think of. Three things about it are
+worth saying plainly.
+
+One timeout is enough to set the flag, and that is a deliberate choice
+rather than an oversight. A host interface adapter whose bit works but
+whose poll happened to time out once - a busy control channel, say -
+would stop being waited on for the rest of that switch's lifetime. I have
+not seen that happen on a host interface adapter, but I have seen a
+single timeout on an adapter that was otherwise fine: the lane adapter of
+this router timed out three times over the same day and drained on the
+first read every other time. That adapter is out of scope here, so it
+would not have been flagged, but it is the shape of the thing I cannot
+rule out. I settled on one because the caller already ignores the
+timeout, so a false positive costs a diagnostic that was being thrown
+away anyway - it is a counter away from being stricter if you would
+rather it were.
+
+I cannot show that skipping the wait is safe. Either controller can stop
+answering config space entirely (probe -110, cold boot to recover); over
+one day I logged 16 of those, five on one host and eleven on the other,
+on the distribution kernel and on the unmodified base as much as with
+anything of mine. None of them fell inside the four 200-cycle runs, which
+between them are about five and a half hours of nothing but bringing the
+link up and down - they cluster around module loads and deployments
+instead. So the runs above cannot speak to that rate either way, and I
+would rather say so than let them suggest the question is settled.
+
+The spec question I raised in v1 is settled, and not in the direction I
+had left room for. I have been through the USB4 v2 specification since,
+and table 8-23 is quoted above: Pending Packets is RO and is not vendor
+defined for a protocol adapter, so the driver is right to poll it and the
+reading under which this patch was working around a symptom of the
+connection manager's own doing is gone. What is left is one router that
+never satisfies a poll the spec requires of it.
+
+For completeness on the teardown sequence itself: the CM guide's 5.2.2
+puts one step before the per-hop loop - disable sending Transport Layer
+Packets on the path at the source and destination adapters. For PCIe and
+USB3 that is ADP_PCIE_CS_0.Path Enable and ADP_USB3_GX_CS_0.Path Enable.
+A host interface adapter has no such bit; the equivalent is quiescing the
+descriptor rings, which is the caller's business rather than this
+function's. I mention it because it is the one part of the sequence that
+is not visible in path.c, so it is worth saying I looked at it and it is
+not where this goes wrong: the pending bit already reads 1b before the
+teardown starts, on an idle path with the rings quiet, so no ordering of
+the steps below it can be the cause.
+
+It would still be worth ASMedia confirming the behaviour against the NVM
+above.
+
+The other thing I would be glad of is coverage. Everything above was
+measured on one model of router, and the flag is only ever set by an
+adapter that has already failed to clear the bit within the existing
+500 ms, so hardware that behaves should never reach it - but that is an
+argument, not a measurement. If anyone with an Intel or Barlow Ridge host
+can run a few hundred link cycles with this applied and confirm the flag
+stays clear, I would be much happier about it than I am now.
+
+v2:
+- Add the Assisted-by tag Mika asked for.
+- Name the baseline in the commit message instead of only down here.
+- Answer the v1 spec question from the specification rather than leaving
+  it open: quote table 8-23, which makes Pending Packets RO and not
+  vendor defined for a protocol adapter.  Dropped the v1 request for
+  someone else to check that field.
+- State the cost of skipping the wait in the spec's own terms (5.4.1),
+  instead of the vaguer "I cannot show this is safe" of v1.
+- Drop the claim that the ring wrapping is what latches the bit.  The two
+  ring sizes measured show the threshold moving with the ring, not a
+  wrap: 120 frames is already enough on a 128 ring.
+- No code change from v1.
+
+v1: https://lore.kernel.org/linux-usb/20260809-b4-tb-teardown-v1-0-c88bbfe5c127@gmail.com/
+---
+ drivers/thunderbolt/path.c | 17 +++++++++++++++++
+ drivers/thunderbolt/tb.h   |  3 +++
+ 2 files changed, 20 insertions(+)
+
+diff --git a/drivers/thunderbolt/path.c b/drivers/thunderbolt/path.c
+index b2c322e76b8a..0dcc3deb6f61 100644
+--- a/drivers/thunderbolt/path.c
++++ b/drivers/thunderbolt/path.c
+@@ -397,6 +397,14 @@ static int __tb_path_deactivate_hop(struct tb_port *port, int hop_index,
+ 	if (ret)
+ 		return ret;
+
++	/*
++	 * This adapter has already been seen to leave the pending bit
++	 * set for good. The answer will not change, so give the caller
++	 * the same answer it would have got, without the wait.
++	 */
++	if (port->drain_known_stuck)
++		return -ETIMEDOUT;
++
+ 	/* Wait until it is drained */
+ 	timeout = ktime_add_ms(ktime_get(), 500);
+ 	do {
+@@ -430,6 +438,15 @@ static int __tb_path_deactivate_hop(struct tb_port *port, int hop_index,
+ 		usleep_range(10, 20);
+ 	} while (ktime_before(ktime_get(), timeout));
+
++	/*
++	 * Some host interface adapters latch the pending bit and never
++	 * clear it again, and there is nothing the connection manager
++	 * can do about that from here. Remember it so the next teardown
++	 * can return this same answer without spending the timeout.
++	 */
++	if (tb_port_is_nhi(port))
++		port->drain_known_stuck = true;
++
+ 	return -ETIMEDOUT;
+ }
+
+diff --git a/drivers/thunderbolt/tb.h b/drivers/thunderbolt/tb.h
+index ec9192b61bc0..8c022d2724e9 100644
+--- a/drivers/thunderbolt/tb.h
++++ b/drivers/thunderbolt/tb.h
+@@ -273,6 +273,8 @@ struct tb_bandwidth_group {
+  * @max_bw: Maximum possible bandwidth through this adapter if set to
+  *	    non-zero.
+  * @redrive: For DP IN, if true the adapter is in redrive mode.
++ * @drain_known_stuck: The pending bit of this adapter's path config space
++ *		       stayed set once, so it is not waited on any more
+  *
+  * In USB4 terminology this structure represents an adapter (protocol or
+  * lane adapter).
+@@ -302,6 +304,7 @@ struct tb_port {
+ 	struct list_head group_list;
+ 	unsigned int max_bw;
+ 	bool redrive;
++	bool drain_known_stuck;
+ };
+
+ /**
+--
+2.43.0
+
