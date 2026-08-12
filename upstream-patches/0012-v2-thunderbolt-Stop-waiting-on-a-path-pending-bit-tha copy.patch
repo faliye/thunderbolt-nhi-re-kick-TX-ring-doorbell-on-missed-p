@@ -1,0 +1,135 @@
+From f15727db0bcee2b79236d78100490c2d6475253a Mon Sep 17 00:00:00 2001
+From: faliye <faliye@example.com>
+Date: Sun, 9 Aug 2026 00:43:40 +0000
+Subject: [PATCH v2] thunderbolt: Stop waiting on a path pending bit that never
+ clears
+
+__tb_path_deactivate_hop() waits up to 500 ms for a hop's pending bit to
+read back clear. On an ASMedia ASM4242 host router the host interface
+adapter latches it once enough frames have gone through the DMA ring and
+never clears it again: the teardown finds it already set, seconds after
+the last frame and with the path still up. USB4 v2 table 8-23 has the
+field read only and zero unless packets belonging to the path are waiting
+to be dequeued, so the wait is right and this adapter is not.
+
+Quirk those routers by hardware id and let a quirked adapter that has
+timed out once answer -ETIMEDOUT immediately from then on. Bringing the
+interface down then took 8 ms across 200 cycles, where unpatched it took
+508 ms in 161 of 162, at an unchanged failure rate of about one per
+cycle.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: faliye <faliye@example.com>
+---
+Measured on two ASM4242 hosts wired to each other, hw_vendor_id 0x174c,
+hw_device_id 0x2428, NVM 200011.250708, on a base that already carries
+68bf02b6b4ad.
+
+Read before the teardown writes anything, path still up and the ring idle
+for seconds: at 200 frames it is clear in 5 of 5 rounds and the hop drains
+on the first read, at 260 it is set in 5 of 5 and the wait runs out. So it
+is set before the teardown starts rather than by it, and the clear case is
+why the flag is learned rather than taken from the quirk alone.
+
+5.4.1 has a connection manager wait tTeardown after the router sets the
+bit to 0b before making the path valid again. On an adapter where it
+never reads 0b there is no such point, patched or not.
+
+v2:
+- Add the Assisted-by tag.
+- Answer the spec question from USB4 v2 table 8-23.
+- Return -ETIMEDOUT instead of 0; gate the flag on a 0x174c/0x2428 quirk.
+- Drop the ring-wrap claim.
+- Cut the text down.
+
+v1: https://lore.kernel.org/linux-usb/20260809-b4-tb-teardown-v1-2-c88bbfe5c127@gmail.com/
+---
+ drivers/thunderbolt/path.c   | 8 ++++++++
+ drivers/thunderbolt/quirks.c | 8 ++++++++
+ drivers/thunderbolt/tb.h     | 4 ++++
+ 3 files changed, 20 insertions(+)
+
+diff --git a/drivers/thunderbolt/path.c b/drivers/thunderbolt/path.c
+index b2c322e76b8a..5cf87b8af2b2 100644
+--- a/drivers/thunderbolt/path.c
++++ b/drivers/thunderbolt/path.c
+@@ -397,6 +397,10 @@ static int __tb_path_deactivate_hop(struct tb_port *port, int hop_index,
+ 	if (ret)
+ 		return ret;
+
++	/* It never clears on this adapter, so the wait would time out again. */
++	if (port->pending_stuck)
++		return -ETIMEDOUT;
++
+ 	/* Wait until it is drained */
+ 	timeout = ktime_add_ms(ktime_get(), 500);
+ 	do {
+@@ -430,6 +434,10 @@ static int __tb_path_deactivate_hop(struct tb_port *port, int hop_index,
+ 		usleep_range(10, 20);
+ 	} while (ktime_before(ktime_get(), timeout));
+
++	/* Remember it only on an adapter known to latch it. */
++	if (tb_port_is_nhi(port) && (port->sw->quirks & QUIRK_STUCK_PENDING))
++		port->pending_stuck = true;
++
+ 	return -ETIMEDOUT;
+ }
+
+diff --git a/drivers/thunderbolt/quirks.c b/drivers/thunderbolt/quirks.c
+index 9f7914ac2f48..6ec90a85bbaf 100644
+--- a/drivers/thunderbolt/quirks.c
++++ b/drivers/thunderbolt/quirks.c
+@@ -52,6 +52,12 @@ static void quirk_block_rpm_in_redrive(struct tb_switch *sw)
+ 	tb_sw_dbg(sw, "preventing runtime PM in DP redrive mode\n");
+ }
+
++static void quirk_stuck_pending(struct tb_switch *sw)
++{
++	sw->quirks |= QUIRK_STUCK_PENDING;
++	tb_sw_dbg(sw, "host interface adapter pending bit does not clear\n");
++}
++
+ struct tb_quirk {
+ 	u16 hw_vendor_id;
+ 	u16 hw_device_id;
+@@ -114,6 +120,8 @@ static const struct tb_quirk tb_quirks[] = {
+ 	{ 0x0438, 0x0209, 0x0000, 0x0000, quirk_clx_disable },
+ 	{ 0x0438, 0x020a, 0x0000, 0x0000, quirk_clx_disable },
+ 	{ 0x0438, 0x020b, 0x0000, 0x0000, quirk_clx_disable },
++	/* ASM4242 never clears the Pending Packets bit of its NHI adapter */
++	{ 0x174c, 0x2428, 0x0000, 0x0000, quirk_stuck_pending },
+ };
+
+ /**
+diff --git a/drivers/thunderbolt/tb.h b/drivers/thunderbolt/tb.h
+index ec9192b61bc0..00eb8d85755a 100644
+--- a/drivers/thunderbolt/tb.h
++++ b/drivers/thunderbolt/tb.h
+@@ -26,6 +26,8 @@
+ #define QUIRK_NO_CLX					BIT(1)
+ /* Need to keep power on while USB4 port is in redrive mode */
+ #define QUIRK_KEEP_POWER_IN_DP_REDRIVE			BIT(2)
++/* Pending Packets bit of the host interface adapter never clears */
++#define QUIRK_STUCK_PENDING				BIT(3)
+
+ /**
+  * struct tb_nvm - Structure holding NVM information
+@@ -273,6 +275,7 @@ struct tb_bandwidth_group {
+  * @max_bw: Maximum possible bandwidth through this adapter if set to
+  *	    non-zero.
+  * @redrive: For DP IN, if true the adapter is in redrive mode.
++ * @pending_stuck: Pending bit did not clear, so it is not waited on again
+  *
+  * In USB4 terminology this structure represents an adapter (protocol or
+  * lane adapter).
+@@ -302,6 +305,7 @@ struct tb_port {
+ 	struct list_head group_list;
+ 	unsigned int max_bw;
+ 	bool redrive;
++	bool pending_stuck;
+ };
+
+ /**
+--
+2.43.0
+
