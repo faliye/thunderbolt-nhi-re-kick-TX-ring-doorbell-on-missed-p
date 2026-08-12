@@ -1,136 +1,490 @@
-# thunderbolt-net 补丁集(ASM4242 / USB4 host-to-host)
+# Thunderbolt-Net Patches for ASM4242 / USB4 Host-to-Host
+
+## 中文 | English | 日本語
+
+---
+
+## 中文
+
+### 简介
 
 两台主机经板载 **ASMedia ASM4242** USB4 直连,跑 `thunderbolt-net`。
-在这套硬件上发现两个缺陷,对应两个补丁。
+在这套硬件上发现多个缺陷,对应多个补丁。目前包括:
 
-> **两个补丁相互独立,不要绑在一起看。**
-> 各自解决不同的问题、各自能单独应用、各自单独验证过。
-> 尤其 `0003` 是可提交上游的通用 bugfix,**不依赖** `0001` 那个厂商 workaround ——
-> 已在**纯净 v6.17 树**(E2E 保持上游原状)上单独编译验证。
+- **0001**: E2E 流控(TX 环)的厂商 workaround
+- **0003/v2**: DMA 路径拆除顺序修复
+- **0004/v2**: 限制 DMA 隧道信用到寄存器容量
+- **0006**: 使用 min 函数计算 DMA 路径信用上限
+- **0009/v3**: 释放 Rx HopID 不匹配时分配的 ID
+- **0010/v3**: 设置连接状态为 down 当建立失败时
+- **0011**: 向调用者报告 DMA 路径拆除失败
+- **0012/v2**: 处理 ASM4242 pending bit 不清零的特性
 
----
-
-## 0003 — 拆除顺序(拟以 RFC 发上游)
-
-`0003-net-thunderbolt-Tear-down-DMA-paths-before-stopping-t.patch`
-
-**为什么发 RFC 而不是 PATCH**:唯一的短板是**没有 Intel host router 做回归对照**
-(tbnet 维护者在 Intel,这是他第一个会问的)。与其发 PATCH 然后被要求补测,
-不如以"我在 ASMedia 上观察到这个、机制分析如下、但无 Intel 硬件、请指教"的姿态发出去 ——
-维护者手上就有 Intel 设备,他们一测便知。
-
-**提交时不要提 0001**:0001 是本机自用的厂商 workaround,与本 bug 无关。
-提了只会让维护者怀疑"你的环境不干净,谁知道是不是那个 revert 引起的"。
-这也正是要在**纯净 v6.17 树**上单独验证的原因 —— 见下面「独立性验证」。
-
-投递:`netdev@vger.kernel.org` + `linux-usb@vger.kernel.org`,
-CC Mika Westerberg / Andreas Noever,主题 `[RFC PATCH net]`。
-
-**问题**:`tbnet_tear_down()` 先 `tb_ring_stop()` 再 `tb_xdomain_disable_paths()`。
-停 ring 会清零 descriptor base,其后备页随即被 dma_unmap_page + __free_pages,在飞的 DMA 从此无处可落;
-随后 `__tb_path_deactivate_hop()` 轮询 hop 的 `pending` 位,在某些 host router 上
-永远等不到清零,烧满 500ms 超时后 `-ETIMEDOUT`。
-
-**状态**:基于 mainline 生成,带 `Fixes: 4944269305df`("thunderbolt: Properly disable path",
-2019-04-18,v5.2 引入 drain-wait 的那个 commit)。**不是** tbnet 初版 `e69b6c02b4c3`——
-初版那会儿 `__tb_path_deactivate_hop()` 还没有 pending-bit 轮询,是 4944269305df 才加上的,
-所以失败模式由它引入,Fixes 应指向它。mainline master 至今仍是原顺序。
-
-### 独立性验证(关键)
-
-在 **v6.17 原版树**上只应用本补丁,**完全不碰 E2E**:
-
-| 模块 | E2E 状态 | 顺序 | `__tb_path_deactivate_hop` 返回值 | `down` |
-|---|---|---|---|---|
-| v6.17 原版 | 上游原状(带 E2E) | 原顺序 | `0`,然后 **`-110`** | 0.503s |
-| v6.17 + 仅 0003 | **上游原状(带 E2E)** | 修复 | `0`,然后 **`0`** | **0.003s** |
-
-两个模块出自同一棵树,机器码级**唯一差异是 `tbnet_tear_down`**。
-=> **0003 单独就能修复,不需要 0001。**
-
-### 其余证据
-
-- **发行版原封不动的模块**(Ubuntu `D7911981177766626E5B3E0`)3 轮全部 `-ETIMEDOUT`
-  —— bug 存在于每个人正在跑的内核里,不是自编译引入的。
-- ABBA 对照(每档 4 轮 × 三档负载,每轮前验证链路 up 且带流量):
-
-  | 负载 | 未打补丁 | 打上补丁 |
-  |---|---|---|
-  | idle | 中位 0.503s,失败 8/8 | 中位 0.003s,失败 0/8 |
-  | light | 0.503s,7/7 | 0.003s,0/8 |
-  | heavy | 0.503s,6/6 | 0.003s,0/8 |
-
-  ⚠️ 未打补丁的组里,**只有 light 与 heavy 被链路打死而提前中止**(各 1 个臂),
-  **idle 那档 4 轮全部跑完、链路未死**。每档仅 1 次死亡观测、idle 右删失、
-  三档按顺序跑未随机化 —— **方向与机制一致,但不能当成实测的剂量效应**。
-
-### 为什么能藏 7 年
-
-1. **失败是静默的** —— 内层 `-ETIMEDOUT`,而 `tb_xdomain_disable_paths()` 仍返回 **0**,
-   tbnet 只在返回非 0 时 `netdev_warn`,于是用户空间和驱动层都看不见;
-2. **只在不容忍的硬件上触发** —— Intel host router 能在 500ms 内排空,ASMedia 排不空;
-3. **单次无感** —— 要反复 `down/up` 才累积到打死 XDomain,正常使用不会反复拆网卡。
+> **重要**: 各补丁相互独立,解决不同问题,可按任意顺序应用。
 
 ---
 
-## 0001 — E2E on TX(厂商 workaround,不指望上游收)
+## 0001 — E2E on TX (厂商 workaround)
 
-`0001-Revert-net-thunderbolt-Enable-end-to-end-flow-contro.patch`
+**文件**: `0001-Revert-net-thunderbolt-Enable-end-to-end-flow-contro.patch`
 
-**问题**:上游把 `RING_FLAG_E2E` 也加到 TX 环。按 USB4 规范,TX 环开 E2E 就必须先拿到
-端到端信用才能发;而 ASM4242 **从不产生 E2E 信用** → TX 消费者永久停摆、大流量传不动。
+**问题**: 上游把 `RING_FLAG_E2E` 也加到 TX 环。按 USB4 规范,TX 环开 E2E 就必须先拿到端到端信用才能发;
+而 ASM4242 **从不产生 E2E 信用** → TX 消费者永久停摆,大流量传不动。
 
-**状态**:那个上游 commit 在 Intel 上是**正确的**,这是 ASMedia 专属 workaround,
-**上游大概率不收**。本机自用。
-
-独立印证:`hellas-ai/thunderbolt-ibverbs` 的 `tbv_native_e2e_auto_enabled()` 按厂商关 E2E,
-注释提到 "Strix Halo has reproduced TX completion wedges with multiple native E2E rings active"。
+**状态**: 该上游 commit 在 Intel 上是正确的,这是 ASMedia 专属 workaround,上游大概率不收,本机自用。
 
 ---
 
-## 两者的关系
+## 0003/v2 — DMA 路径拆除顺序
 
-**没有依赖关系。** 各自独立应用、独立生效:
+**文件**: `0003-v2-net-thunderbolt-Tear-down-DMA-paths-before-stoppin.patch`
 
-- 只打 0003:拆除干净了,但 ASM4242 上大流量仍传不动(E2E 问题还在)
-- 只打 0001:能传数据了,但反复 `down/up` 仍会把 XDomain 打死
-- 本机两个都打,是因为这套硬件两个毛病都有 —— **不是因为它们互相需要**
+**问题**:
 
-hunk 位置也不重叠(0001 在 `tbnet_open`,0003 在 `tbnet_tear_down`),
-可按任意顺序应用,已实测共存无冲突。
+- `tbnet_tear_down()` 先 `tb_ring_stop()` 再 `tb_xdomain_disable_paths()`
+- 停 ring 会清零 descriptor base,其后备页被立即 dma_unmap_page + __free_pages
+- 在飞的 DMA 从此无处可落
+- 随后 `__tb_path_deactivate_hop()` 轮询 hop 的 `pending` 位,在某些 host router 上永远等不到清零
+- 500ms 超时后返回 `-ETIMEDOUT`,但 `tb_xdomain_disable_paths()` 仍返回 0(静默失败)
+
+**解决**: 调整拆除顺序,先拆 paths 再停 ring,确保在飞 DMA 有目标缓冲区。
+
+**验证**: 在纯净 v6.17 树上(不含其他补丁)单独应用本补丁,拆除时间从 0.503s 降至 0.003s。
 
 ---
 
-## 已作废,不要发
+## 0004/v2 — 限制 DMA 隧道信用
 
-| 文件 | 原因 |
-|---|---|
-| `0001-SUPERSEDED-do-not-enable-E2E-on-Tx-*.patch` | 被 `0001-Revert-*` 取代 |
-| `0002-SUPERSEDED-hand-written-*.patch` | 手写版,已废 |
-| `0001-thunderbolt-nhi-re-kick-TX-ring-doorbell-*.patch` | 复评为冗余(E2E revert 落地后 `kick_stuck=0`) |
-| `dma-wall-rescue-worktree.patch` | 5.1G 带宽墙的实验残留,非修复 |
+**文件**: `0004-v2-thunderbolt-Clamp-DMA-tunnel-credits-to-what-a-ho.patch`
 
-## 模块身份对照(本机)
+**问题**:
 
-**按实际源码内容核实(2026-07-31),不要信目录名:**
+- `struct tb_regs_hop::initial_credits` 是 7 bits 宽(最大 127)
+- `dma_credits` 模块参数和 host router 的 `baMaxHI` 都没有上限检查
+- 超大值在 `tb_path_activate()` 时被截断,路径以错误的信用数运行
 
-| 目录 / 模块 | srcversion | 拆除顺序 | MAC ndo | TX E2E |
-|---|---|---|---|---|
-| 发行版原版 | `D7911981177766626E5B3E0` | 原顺序 | 无 | 带 E2E |
-| `v617-independence/v617-stock.ko` | `5F59B1ACF3F639A7FCC48EA` | 原顺序 | 无 | 带 E2E |
-| `v617-independence/v617-fix.ko` | `AFB83C35024747B5A67D991` | **已修复** | 无 | 带 E2E |
-| `tbnet-ctrl` | `695E9AC63CB1D9B494DCA04` | 原顺序 | 有 | 已 revert |
-| `tbnet-orderswap` | `B5B3B9087470F3CDF56F427` | **已修复** | 有 | 已 revert(**生产在用**) |
-| `tbnet-macfix` | `AFB83C35024747B5A67D991` | **已修复** | **无** | **带 E2E** |
-| `tbnet-test` | (无 .ko) | 原顺序 | 无 | 已 revert |
+**解决**: 在 `tb_tunnel_alloc_dma()` 中将信用数钳制到 127。
 
-⚠️ **`tbnet-macfix` 这个目录名是误导的**:它里面**没有** MAC 修复,也**没有** E2E revert,
-实际内容 = **v6.17 原版 + 仅 0003**,与 `v617-fix.ko` 机器码完全相同(srcversion 也相同)。
-这个目录是调查早期留下的,名字起错了。**以内容为准,不要以目录名为准。**
+**测试**: ASM4242 报告 174 个缓冲区,请求 172 个信用时,修复前读回 44(172 & 0x7f),修复后读回 127。
 
-⚠️ **`srcversion` 对注释不敏感**:实测改了代码注释后重新编译,srcversion 与机器码均不变。
-它能区分"代码逻辑变了",但**不是源码内容的唯一指纹** —— 做模块身份核对时要意识到这一点。
+---
 
-> 另有一处非上游改动:`.ndo_set_mac_address = eth_mac_addr`。
-> mainline 已有此行,属 6.17 backport 落后,**不需要提交**。
-> 没有它 `ip link set thunderbolt0 address` 返回 -95,TB 进不了 bond。
+## 0006 — 使用 min 计算信用上限
+
+**文件**: `0006-thunderbolt-Use-min-for-the-DMA-path-credit-cap.patch`
+
+**说明**: 简化信用上限计算,使用 min 函数。
+
+---
+
+## 0009/v3 — 释放 Rx HopID
+
+**文件**: `0009-v3-net-thunderbolt-Release-the-Rx-HopID-that-was-hand.patch`
+
+**问题**:
+
+- `tb_xdomain_alloc_in_hopid()` 将所需 HopID 作为下限传给分配器,返回第一个空闲 ID
+- `tbnet_connected_work()` 期望得到特定 ID,其他 ID 视为失败
+- 分配的 ID 没有被释放,导致该 allocation 在 XDomain 连接期间一直占用,没有引用计数
+
+**解决**: 当 ID 不是期望的那个时释放它。
+
+**Fixes**: `180b0689425c` ("thunderbolt: Allow multiple DMA tunnels over a single XDomain connection")
+
+---
+
+## 0010/v3 — 标记连接为 down
+
+**文件**: `0010-v3-net-thunderbolt-Mark-the-connection-down-when-brin.patch`
+
+**问题**:
+
+- `tbnet_connected_work()` 中所有失败路径都不清除 `login_sent` 标志
+- 连接仍然看起来已建立
+- 随后的 `tbnet_tear_down()` 会重复拆除:停止已停止的 ring(触发 dev_WARN),释放不属于本端的 HopID
+
+**解决**: 在这些失败路径上清除 `login_sent` 标志,让 `tbnet_tear_down()` 忽略该连接。
+
+**Fixes**: `e69b6c02b4c3` ("net: Add support for networking over Thunderbolt cable")
+
+---
+
+## 0011 — 报告 DMA 路径拆除失败
+
+**文件**: `0011-thunderbolt-Report-DMA-path-teardown-failures-to-the.patch`
+
+**问题**:
+
+- `tb_disconnect_xdomain_paths()` 无条件返回 0
+- 内层失败(hop 拒绝 drain, `-ETIMEDOUT`)被隐藏
+- 连接管理器报告成功,上层 tbnet 看不到失败
+
+**解决**:
+
+- 传播拆除过程中的第一个错误
+- 返回值通过 `tb_path_deactivate()` → `tb_tunnel_deactivate()` → `tb_deactivate_and_free_tunnel()` 传递
+- 拆除仍继续至完成(路径标记为 inactive、信用释放、隧道释放)
+- 只改变返回值,调用者看得到真实状态
+
+---
+
+## 0012/v2 — ASM4242 pending bit 特性处理
+
+**文件**: `0012-v2-thunderbolt-Stop-waiting-on-a-path-pending-bit-tha.patch`
+
+**问题**:
+
+- ASM4242 host interface adapter 在 DMA ring 经历足够多帧后,pending bit 锁定不再变化
+- 每次拆除都要等 500ms 才超时
+- 频繁 down/up 会累积大量超时
+
+**观察**:
+
+- bit 行为分两个阶段,帧数量决定阶段转换
+- ring 大小决定临界帧数(ring 128 时约 120 帧,ring 256 时约 260 帧)
+- 其他 hop 正常清零,只有 host 端受影响
+
+**解决**: 为 ASM4242 添加 quirk,在 pending bit 检查中跳过该特殊 host adapter(或超时更短)。
+
+---
+
+## 补丁关系
+
+所有补丁相互独立:
+
+| 补丁 | 依赖 | 应用顺序 |
+|---|---|---|
+| 0001 | 无 | 任意 |
+| 0003/v2 | 无 | 任意 |
+| 0004/v2 | 无 | 任意 |
+| 0006 | 可选依赖 0004 | 0004 之后 |
+| 0009/v3 | 无 | 任意 |
+| 0010/v3 | 依赖 0009/v3 | 0009 之后 |
+| 0011 | 无 | 任意 |
+| 0012/v2 | 无 | 任意 |
+
+---
+
+---
+
+## English
+
+### Overview
+
+Two hosts connected directly via on-board **ASMedia ASM4242** USB4 running `thunderbolt-net`.
+Multiple defects found on this hardware, with corresponding patches:
+
+- **0001**: E2E flow control (TX ring) vendor workaround
+- **0003/v2**: DMA path teardown order fix
+- **0004/v2**: Clamp DMA tunnel credits to register capacity
+- **0006**: Use min() for DMA path credit cap
+- **0009/v3**: Release Rx HopID on allocation mismatch
+- **0010/v3**: Mark connection down when bring-up fails
+- **0011**: Report DMA path teardown failures to caller
+- **0012/v2**: Handle ASM4242 pending bit that never clears
+
+> **Important**: Patches are independent, solve different problems, can be applied in any order.
+
+---
+
+## 0001 — E2E on TX (Vendor Workaround)
+
+**File**: `0001-Revert-net-thunderbolt-Enable-end-to-end-flow-contro.patch`
+
+**Issue**: Upstream adds `RING_FLAG_E2E` to TX ring. Per USB4 spec, enabling E2E on TX requires end-to-end credits before sending;
+but ASM4242 **never generates E2E credits** → TX consumer permanently stalled, large flows cannot pass.
+
+**Status**: The upstream commit is correct on Intel; this is ASMedia-specific workaround, upstream unlikely to merge, local use only.
+
+---
+
+## 0003/v2 — DMA Path Teardown Order
+
+**File**: `0003-v2-net-thunderbolt-Tear-down-DMA-paths-before-stoppin.patch`
+
+**Issue**:
+
+- `tbnet_tear_down()` calls `tb_ring_stop()` then `tb_xdomain_disable_paths()`
+- Stopping ring clears descriptor base, backing pages immediately dma_unmap_page + __free_pages
+- In-flight DMAs have nowhere to land
+- Then `__tb_path_deactivate_hop()` polls hop's `pending` bit, on some host routers never sees it clear
+- After 500ms timeout returns `-ETIMEDOUT`, but `tb_xdomain_disable_paths()` still returns 0 (silent failure)
+
+**Fix**: Reorder teardown: disable paths first, then stop ring, ensuring in-flight DMA has target buffers.
+
+**Verification**: Apply only this patch on clean v6.17 tree, teardown time drops from 0.503s to 0.003s.
+
+---
+
+## 0004/v2 — Clamp DMA Tunnel Credits
+
+**File**: `0004-v2-thunderbolt-Clamp-DMA-tunnel-credits-to-what-a-ho.patch`
+
+**Issue**:
+
+- `struct tb_regs_hop::initial_credits` is 7 bits wide (max 127)
+- Neither `dma_credits` module parameter nor host router `baMaxHI` have upper bounds
+- Oversized value gets truncated when `tb_path_activate()` writes to register, path runs with wrong credit count
+
+**Fix**: Clamp credits to 127 in `tb_tunnel_alloc_dma()`.
+
+**Test**: ASM4242 reports 174 buffers, requesting 172 credits: before fix reads 44 (172 & 0x7f), after fix reads 127.
+
+---
+
+## 0006 — Use min() for Credit Cap
+
+**File**: `0006-thunderbolt-Use-min-for-the-DMA-path-credit-cap.patch`
+
+**Note**: Simplify credit cap calculation using min() function.
+
+---
+
+## 0009/v3 — Release Rx HopID
+
+**File**: `0009-v3-net-thunderbolt-Release-the-Rx-HopID-that-was-hand.patch`
+
+**Issue**:
+
+- `tb_xdomain_alloc_in_hopid()` passes desired HopID as lower bound to allocator, returns first free ID above it
+- `tbnet_connected_work()` expects specific ID, treats any other as failure
+- Allocated ID is never released, stays live for entire XDomain connection with no refcount
+
+**Fix**: Release ID when it's not the one we asked for.
+
+**Fixes**: `180b0689425c` ("thunderbolt: Allow multiple DMA tunnels over a single XDomain connection")
+
+---
+
+## 0010/v3 — Mark Connection Down
+
+**File**: `0010-v3-net-thunderbolt-Mark-the-connection-down-when-brin.patch`
+
+**Issue**:
+
+- All failure paths in `tbnet_connected_work()` fail to clear `login_sent` flag
+- Connection still looks established
+- Subsequent `tbnet_tear_down()` repeats teardown: stops already-stopped rings (triggers dev_WARN), releases HopID we never owned
+
+**Fix**: Clear `login_sent` flag on these failure paths, let `tbnet_tear_down()` skip this connection.
+
+**Fixes**: `e69b6c02b4c3` ("net: Add support for networking over Thunderbolt cable")
+
+---
+
+## 0011 — Report Teardown Failures
+
+**File**: `0011-thunderbolt-Report-DMA-path-teardown-failures-to-the.patch`
+
+**Issue**:
+
+- `tb_disconnect_xdomain_paths()` unconditionally returns 0
+- Internal failures (hop refuses drain, `-ETIMEDOUT`) hidden
+- Connection manager reports success, upper layer tbnet sees nothing
+
+**Fix**:
+
+- Propagate first error seen while deactivating hops
+- Return value flows through `tb_path_deactivate()` → `tb_tunnel_deactivate()` → `tb_deactivate_and_free_tunnel()`
+- Teardown still runs to completion (paths marked inactive, credits released, tunnel freed)
+- Only changes return value; callers that check it now get truth
+
+---
+
+## 0012/v2 — ASM4242 Pending Bit Quirk
+
+**File**: `0012-v2-thunderbolt-Stop-waiting-on-a-path-pending-bit-tha.patch`
+
+**Issue**:
+
+- ASM4242 host interface adapter's pending bit latches after enough frames through DMA ring, never clears again
+- Every teardown waits full 500ms before timeout
+- Frequent down/up cycles accumulate many timeouts
+
+**Observation**:
+
+- Bit behaves in two regimes, frame count determines transition
+- Ring size determines frame threshold (ring 128 ~120 frames, ring 256 ~260 frames)
+- Other hops clear normally, only host adapter affected
+
+**Fix**: Add quirk for ASM4242 to skip pending bit wait on this special host adapter.
+
+---
+
+## Patch Relationships
+
+All patches are independent:
+
+| Patch | Dependencies | Order |
+|---|---|---|
+| 0001 | None | Any |
+| 0003/v2 | None | Any |
+| 0004/v2 | None | Any |
+| 0006 | Optional after 0004 | After 0004 |
+| 0009/v3 | None | Any |
+| 0010/v3 | Requires 0009/v3 | After 0009 |
+| 0011 | None | Any |
+| 0012/v2 | None | Any |
+
+---
+
+---
+
+## 日本語
+
+### 概要
+
+ASMedia ASM4242 USB4 でホスト間に直接接続された 2 台のマシンで `thunderbolt-net` を実行。
+このハードウェアで複数の欠陥を発見し、対応するパッチを用意しました:
+
+- **0001**: E2E フロー制御(TX リング)ベンダー回避策
+- **0003/v2**: DMA パス破棄順序の修正
+- **0004/v2**: DMA トンネルクレジットをレジスタ容量に制限
+- **0006**: DMA パスクレジット上限に min() を使用
+- **0009/v3**: 割り当てミスマッチ時の Rx HopID を解放
+- **0010/v3**: ブリングアップ失敗時に接続を down にマーク
+- **0011**: DMA パス破棄失敗を呼び出し者に報告
+- **0012/v2**: クリアされない ASM4242 pending bit に対応
+
+> **重要**: パッチは独立しており、異なる問題を解決し、任意の順序で適用できます。
+
+---
+
+## 0001 — E2E on TX (ベンダー回避策)
+
+**ファイル**: `0001-Revert-net-thunderbolt-Enable-end-to-end-flow-contro.patch`
+
+**問題**: アップストリームが `RING_FLAG_E2E` を TX リングにも追加します。USB4 仕様によれば、TX リングで E2E を有効にするには送信前にエンドツーエンドクレジットを取得する必要があります。
+しかし ASM4242 は **E2E クレジットを生成しない** → TX コンシューマが永続的に停止、大きなフローが通過できません。
+
+**ステータス**: アップストリームコミットは Intel では正しく、これは ASMedia 固有の回避策で、アップストリームではマージされない可能性があり、ローカル使用のみです。
+
+---
+
+## 0003/v2 — DMA パス破棄順序
+
+**ファイル**: `0003-v2-net-thunderbolt-Tear-down-DMA-paths-before-stoppin.patch`
+
+**問題**:
+
+- `tbnet_tear_down()` は `tb_ring_stop()` を呼び出してから `tb_xdomain_disable_paths()` を呼び出します
+- リングを停止するとディスクリプタベースがクリアされ、バッキングページが dma_unmap_page + __free_pages で即座に解放されます
+- 飛行中の DMA には着地点がありません
+- その後 `__tb_path_deactivate_hop()` は hop の `pending` ビットをポーリングしますが、一部の host router ではクリアを見ることができません
+- 500ms タイムアウト後に `-ETIMEDOUT` を返しますが、`tb_xdomain_disable_paths()` は依然として 0 を返します(静かな失敗)
+
+**修正**: 破棄順序を変更: パスを無効にしてからリングを停止し、飛行中 DMA にターゲットバッファがあることを確認します。
+
+**検証**: クリーンな v6.17 ツリーでこのパッチのみを適用すると、破棄時間は 0.503s から 0.003s に短縮されます。
+
+---
+
+## 0004/v2 — DMA トンネルクレジットを制限
+
+**ファイル**: `0004-v2-thunderbolt-Clamp-DMA-tunnel-credits-to-what-a-ho.patch`
+
+**問題**:
+
+- `struct tb_regs_hop::initial_credits` は 7 ビット幅(最大 127)
+- `dma_credits` モジュールパラメータも host router の `baMaxHI` も上限チェックがありません
+- オーバーサイズ値は `tb_path_activate()` がレジスタに書き込むときに切り詰められ、パスは間違ったクレジット数で実行されます
+
+**修正**: `tb_tunnel_alloc_dma()` でクレジットを 127 に制限します。
+
+**テスト**: ASM4242 は 174 バッファを報告、172 クレジットをリクエスト: 修正前は 44(172 & 0x7f)を読み取り、修正後は 127 を読み取ります。
+
+---
+
+## 0006 — min() を使用してクレジット上限を計算
+
+**ファイル**: `0006-thunderbolt-Use-min-for-the-DMA-path-credit-cap.patch`
+
+**注記**: min() 関数を使用してクレジット上限計算を簡略化します。
+
+---
+
+## 0009/v3 — Rx HopID を解放
+
+**ファイル**: `0009-v3-net-thunderbolt-Release-the-Rx-HopID-that-was-hand.patch`
+
+**問題**:
+
+- `tb_xdomain_alloc_in_hopid()` は目的の HopID をアロケータの下限として渡し、その上の最初の空き ID を返します
+- `tbnet_connected_work()` は特定の ID を期待し、他の ID を失敗として扱います
+- 割り当てられた ID は解放されず、XDomain 接続全体にわたって生き続け、参照カウンターがありません
+
+**修正**: 要求した ID でない場合は ID を解放します。
+
+**修正対象**: `180b0689425c` ("thunderbolt: Allow multiple DMA tunnels over a single XDomain connection")
+
+---
+
+## 0010/v3 — 接続を down にマーク
+
+**ファイル**: `0010-v3-net-thunderbolt-Mark-the-connection-down-when-brin.patch`
+
+**問題**:
+
+- `tbnet_connected_work()` のすべての失敗パスが `login_sent` フラグをクリアしません
+- 接続はまだ確立されているように見えます
+- その後の `tbnet_tear_down()` は破棄を繰り返します: 既に停止しているリングを停止(dev_WARN をトリガー)、所有していない HopID を解放します
+
+**修正**: これらの失敗パスで `login_sent` フラグをクリアし、`tbnet_tear_down()` がこの接続をスキップするようにします。
+
+**修正対象**: `e69b6c02b4c3` ("net: Add support for networking over Thunderbolt cable")
+
+---
+
+## 0011 — 破棄失敗を報告
+
+**ファイル**: `0011-thunderbolt-Report-DMA-path-teardown-failures-to-the.patch`
+
+**問題**:
+
+- `tb_disconnect_xdomain_paths()` は無条件に 0 を返します
+- 内部失敗(hop が drain を拒否、`-ETIMEDOUT`)は隠されます
+- 接続マネージャーはすべてのエラーを成功として報告し、その上層 tbnet は何も表示されません
+
+**修正**:
+
+- hop を無効化する際に見られた最初のエラーを伝播します
+- 戻り値は `tb_path_deactivate()` → `tb_tunnel_deactivate()` → `tb_deactivate_and_free_tunnel()` を通じて流れます
+- 破棄は依然として完了まで実行されます(パスは inactive にマーク、クレジット解放、トンネル解放)
+- 戻り値のみが変わり、チェックする呼び出し元は真実を取得します
+
+---
+
+## 0012/v2 — ASM4242 Pending Bit Quirk
+
+**ファイル**: `0012-v2-thunderbolt-Stop-waiting-on-a-path-pending-bit-tha.patch`
+
+**問題**:
+
+- ASM4242 host interface adapter の pending ビットは DMA リングを十分なフレーム数が通過した後にラッチし、二度とクリアされません
+- すべての破棄は 500ms 待機してからタイムアウトします
+- 頻繁な down/up サイクルは多くのタイムアウトを累積します
+
+**観察**:
+
+- ビットは 2 つのレジーム で動作し、フレーム数が遷移を決定します
+- リングサイズがフレームしきい値を決定します(リング 128 ~120 フレーム、リング 256 ~260 フレーム)
+- 他の hop は正常にクリアされ、host adapter のみが影響を受けます
+
+**修正**: ASM4242 の quirk を追加して、この特別な host adapter での pending ビット待機をスキップします。
+
+---
+
+## パッチの関係
+
+すべてのパッチは独立しています:
+
+| パッチ | 依存関係 | 順序 |
+|---|---|---|
+| 0001 | なし | 任意 |
+| 0003/v2 | なし | 任意 |
+| 0004/v2 | なし | 任意 |
+| 0006 | 0004 の後で依存 | 0004 の後 |
+| 0009/v3 | なし | 任意 |
+| 0010/v3 | 0009/v3 が必須 | 0009 の後 |
+| 0011 | なし | 任意 |
+| 0012/v2 | なし | 任意 |
