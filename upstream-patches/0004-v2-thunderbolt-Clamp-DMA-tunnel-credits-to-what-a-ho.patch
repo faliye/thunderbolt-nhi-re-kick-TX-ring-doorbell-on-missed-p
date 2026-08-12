@@ -1,0 +1,75 @@
+From fca72addd83eca11b81239fddb68b7bebbca99c0 Mon Sep 17 00:00:00 2001
+From: faliye <faliye@example.com>
+Date: Fri, 7 Aug 2026 19:27:00 +0000
+Subject: [PATCH v2] thunderbolt: Clamp DMA tunnel credits to what a hop
+ register can hold
+
+struct tb_regs_hop::initial_credits is 7 bits wide, but neither of the
+values tb_tunnel_alloc_dma() picks from is bounded by that: the
+dma_credits module parameter has no upper limit, and neither does the
+host router's baMaxHI. A larger count survives until tb_path_activate()
+copies it into the register and keeps the low bits, leaving the path on
+a credit count nobody asked for.
+
+Clamp it in tb_tunnel_alloc_dma(), the only entry point for DMA tunnels;
+every step below it can only lower the value further. Carry the count in
+an unsigned int while at it.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: faliye <faliye@example.com>
+---
+Reproduced by dropping the baMaxHI cap with a debug patch and asking an
+ASMedia ASM4242 host router, whose lane adapters report 174 buffers, for
+172 credits: reading the hop back after tb_path_activate() showed 44,
+that is 172 & 0x7f.  With this patch it shows 127.  The defaults do not
+reach it - dma_credits is 14 and this router reports baMaxHI 32.
+
+v2:
+- Trim the commit message and these notes.
+- Drop the Fixes: tag.
+- Rename TB_MAX_HOP_CREDITS to TB_MAX_CREDITS and cut the comment above
+  it down to one line.
+
+v1: https://lore.kernel.org/r/20260810-tb-dma-credit-clamp-v1-1-69610146d164@gmail.com
+
+ drivers/thunderbolt/tunnel.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/thunderbolt/tunnel.c b/drivers/thunderbolt/tunnel.c
+index b7f32305f14a..da4fa7b1b248 100644
+--- a/drivers/thunderbolt/tunnel.c
++++ b/drivers/thunderbolt/tunnel.c
+@@ -48,6 +48,9 @@
+ #define TB_DP_AUX_PRIORITY		2
+ #define TB_DP_AUX_WEIGHT		1
+
++/* struct tb_regs_hop::initial_credits is 7 bits wide */
++#define TB_MAX_CREDITS			127
++
+ /* Minimum number of credits needed for PCIe path */
+ #define TB_MIN_PCIE_CREDITS		6U
+ /*
+@@ -1908,7 +1911,7 @@ struct tb_tunnel *tb_tunnel_alloc_dma(struct tb *tb, struct tb_port *nhi,
+ 	struct tb_tunnel *tunnel;
+ 	size_t npaths = 0, i = 0;
+ 	struct tb_path *path;
+-	int credits;
++	unsigned int credits;
+
+ 	/* Ring 0 is reserved for control channel */
+ 	if (WARN_ON(!receive_ring || !transmit_ring))
+@@ -1931,6 +1934,11 @@ struct tb_tunnel *tb_tunnel_alloc_dma(struct tb *tb, struct tb_port *nhi,
+ 	tunnel->destroy = tb_dma_destroy;
+
+ 	credits = min_not_zero(dma_credits, nhi->sw->max_dma_credits);
++	if (credits > TB_MAX_CREDITS) {
++		tb_tunnel_dbg(tunnel, "%u credits do not fit a hop, using %u\n",
++			      credits, TB_MAX_CREDITS);
++		credits = TB_MAX_CREDITS;
++	}
+
+ 	if (receive_ring > 0) {
+ 		path = tb_path_alloc(tb, dst, receive_path, nhi, receive_ring, 0,
+--
+2.43.0
+
