@@ -9,18 +9,20 @@
 ### 简介
 
 两台主机经板载 **ASMedia ASM4242** USB4 直连,跑 `thunderbolt-net`。
-在这套硬件上发现多个缺陷,对应多个补丁。目前包括:
+在这套硬件上发现多个缺陷,对应多个补丁。目前包括(2026-08-19 现查状态):
 
-- **0001**: E2E 流控(TX 环)的厂商 workaround
-- **0003/v2**: DMA 路径拆除顺序修复
-- **0004/v2**: 限制 DMA 隧道信用到寄存器容量
-- **0006**: 使用 min 函数计算 DMA 路径信用上限
-- **0009/v3**: 释放 Rx HopID 不匹配时分配的 ID
-- **0010/v3**: 设置连接状态为 down 当建立失败时
-- **0011**: 向调用者报告 DMA 路径拆除失败
-- **0012/v2**: 处理 ASM4242 pending bit 不清零的特性
+- **0001**: E2E 流控(TX 环)—— ✅ 已合入 Linus 主线
+- **0003/v2**: DMA 路径拆除顺序修复 —— ✅ 已合入 Linus 主线
+- **0004/v2**: 限制 DMA 隧道信用到寄存器容量 —— 已被维护者收入 `next`,等待合并窗口
+- **0006**: 使用 min 函数计算 DMA 路径信用上限 —— 同上
+- **0007**: 修正 tbnet 接收统计(误把帧数当包数)—— 已提交,已获评审者 Reviewed-by
+- **0009/v3**: 释放 Rx HopID 不匹配时分配的 ID —— ✅ 已合入 netdev 树
+- **0010/v3**: 设置连接状态为 down 当建立失败时 —— ✅ 已合入 netdev 树
+- **0011**: 向调用者报告 DMA 路径拆除失败 —— ❌ 已放弃,不会提交
+- **0012/v3**: 处理 ASM4242 pending bit 不清零的特性 —— 已提交,等待评审
 
-> **重要**: 各补丁相互独立,解决不同问题,可按任意顺序应用。
+> **重要**: 各补丁相互独立,解决不同问题,可按任意顺序应用。逐条详情见下文,
+> 上游落地状态会随时间变化,请以各节的「状态」行为准。
 
 ---
 
@@ -31,7 +33,9 @@
 **问题**: 上游把 `RING_FLAG_E2E` 也加到 TX 环。按 USB4 规范,TX 环开 E2E 就必须先拿到端到端信用才能发;
 而 ASM4242 **从不产生 E2E 信用** → TX 消费者永久停摆,大流量传不动。
 
-**状态**: 该上游 commit 在 Intel 上是正确的,这是 ASMedia 专属 workaround,上游大概率不收,本机自用。
+**状态**: ✅ 已被上游接受 —— 2026-07-30 由 netdev maintainer Jakub Kicinski 收入
+`net-next`(commit `1881f2efbf7f`,`Acked-by: Mika Westerberg`),现已在 Linus 的
+`master` 中。
 
 ---
 
@@ -51,6 +55,9 @@
 
 **验证**: 在纯净 v6.17 树上(不含其他补丁)单独应用本补丁,拆除时间从 0.503s 降至 0.003s。
 
+**状态**: ✅ 已被上游接受(`Acked-by: Mika Westerberg`),已在 Linus 的 `master` 中
+(commit `68bf02b6b4ad`)。
+
 ---
 
 ## 0004/v2 — 限制 DMA 隧道信用
@@ -67,6 +74,10 @@
 
 **测试**: ASM4242 报告 174 个缓冲区,请求 172 个信用时,修复前读回 44(172 & 0x7f),修复后读回 127。
 
+**状态**: 已被 thunderbolt 维护者 Mika Westerberg 直接收入他的 `next` 分支
+(commit `86feaba911f2`),已打包进 `thunderbolt-for-v7.3-rc1` 标签,
+等待下一次内核合并窗口进入 Linus 主线。
+
 ---
 
 ## 0006 — 使用 min 计算信用上限
@@ -74,6 +85,30 @@
 **文件**: `0006-thunderbolt-Use-min-for-the-DMA-path-credit-cap.patch`
 
 **说明**: 简化信用上限计算,使用 min 函数。
+
+**状态**: 与 0004/v2 同批收入维护者 `next` 分支(commit `e8158c8a6a23`),
+同样等待合并窗口。
+
+---
+
+## 0007 — 修正 tbnet 接收统计
+
+**文件**: `0007-net-thunderbolt-Count-delivered-packets-in-rx_packe.patch`
+
+**问题**:
+
+- `rx_packets` 在收到每一**帧**时就自增,但一个逻辑包在 MTU 超过单帧上限
+  (`TBNET_MAX_PAYLOAD_SIZE`)时会被拆成多帧传输
+- 于是 `rx_packets` 数的其实是帧数,`rx_bytes` 也统计了尚未拼完、随后
+  可能被丢弃的半包
+- MTU 65330 时,接收端上报的包数约为发送端的 16 倍
+
+**解决**: 把计数挪到包真正拼完、交付协议栈的那一刻。
+
+**测试**: `rx_packets` 与对端 `InReceives` 的比值从 15.899 降到 0.992;
+`rx_bytes/rx_packets` 从 4083.9(帧大小)恢复到 65308.3(实际包大小)。
+
+**状态**: 已提交,已获 Simon Horman 的 `Reviewed-by`,尚未被维护者合并。
 
 ---
 
@@ -91,6 +126,10 @@
 
 **Fixes**: `180b0689425c` ("thunderbolt: Allow multiple DMA tunnels over a single XDomain connection")
 
+**状态**: ✅ 已被 netdev maintainer Jakub Kicinski 收入 `net.git`/`net-next.git`
+的 `main`(2026-08-17,commit `2f1463554d05`,`Acked-by: Mika Westerberg` +
+`Reviewed-by: Simon Horman`),尚未到 Linus 的 `master`。
+
 ---
 
 ## 0010/v3 — 标记连接为 down
@@ -107,11 +146,16 @@
 
 **Fixes**: `e69b6c02b4c3` ("net: Add support for networking over Thunderbolt cable")
 
+**状态**: ✅ 已被 netdev maintainer Jakub Kicinski 收入 `net.git`/`net-next.git`
+的 `main`(2026-08-17,commit `3c8b26ebf525`,`Acked-by: Mika Westerberg` +
+`Reviewed-by: Simon Horman`),尚未到 Linus 的 `master`。
+
 ---
 
-## 0011 — 报告 DMA 路径拆除失败
+## 0011 — 报告 DMA 路径拆除失败(已放弃)
 
-**文件**: `0011-thunderbolt-Report-DMA-path-teardown-failures-to-the.patch`
+**文件**: `0011-ABANDONED-v2-thunderbolt-Report-DMA-path-teardown-fai.patch`
+(留存作证据存档,不要提交)
 
 **问题**:
 
@@ -126,11 +170,15 @@
 - 拆除仍继续至完成(路径标记为 inactive、信用释放、隧道释放)
 - 只改变返回值,调用者看得到真实状态
 
+**状态**: ❌ 已放弃,不会提交上游 —— 同一个返回值在 ICM 与软件连接管理器上含义
+不同(前者非 0 表示隧道可能还在,后者非 0 表示隧道已拆、只是某一跳没排空),
+公共头只给调用方一个不透明指针,分不清自己在跟哪一种通信,给不出统一契约。
+
 ---
 
-## 0012/v2 — ASM4242 pending bit 特性处理
+## 0012/v3 — ASM4242 pending bit 特性处理
 
-**文件**: `0012-v2-thunderbolt-Stop-waiting-on-a-path-pending-bit-tha.patch`
+**文件**: `0012-v3-thunderbolt-Stop-waiting-on-a-path-pending-bit-tha.patch`
 
 **问题**:
 
@@ -144,7 +192,15 @@
 - ring 大小决定临界帧数(ring 128 时约 120 帧,ring 256 时约 260 帧)
 - 其他 hop 正常清零,只有 host 端受影响
 
-**解决**: 为 ASM4242 添加 quirk,在 pending bit 检查中跳过该特殊 host adapter(或超时更短)。
+**解决(v3)**: 把 500ms 等待做成 host router 自己的属性,对 ASM4242(`1b21:2425`)
+按 quirk 置为 0——循环仍读一次:排得空的那次上报排空,排不空的直接返回
+`-ETIMEDOUT`,不再空等 500ms。上一版(v2)是全局跳过检查,v3 改成了按硬件 ID 的
+quirk,粒度更细。
+
+**状态**: 已提交(v3),设计与实现细节已在邮件里和维护者(Mika Westerberg)谈妥
+并获认可("Sounds good")。维护者说明他的 `next` 分支已为当前发布周期冻结,
+要等下一个版本发布后才会开始处理排队的补丁——v3 就是照此有意提前发出、排队
+等待的,当前的"无评审动态"是预期状态,不是被忽略。上一版(v2)已废弃,不要再用。
 
 ---
 
@@ -158,10 +214,11 @@
 | 0003/v2 | 无 | 任意 |
 | 0004/v2 | 无 | 任意 |
 | 0006 | 可选依赖 0004 | 0004 之后 |
+| 0007 | 无 | 任意 |
 | 0009/v3 | 无 | 任意 |
 | 0010/v3 | 依赖 0009/v3 | 0009 之后 |
-| 0011 | 无 | 任意 |
-| 0012/v2 | 无 | 任意 |
+| 0011 | 无(已放弃,不提交) | — |
+| 0012/v3 | 无 | 任意 |
 
 ---
 
@@ -172,18 +229,22 @@
 ### Overview
 
 Two hosts connected directly via on-board **ASMedia ASM4242** USB4 running `thunderbolt-net`.
-Multiple defects found on this hardware, with corresponding patches:
+Multiple defects found on this hardware, with corresponding patches
+(status as of 2026-08-19):
 
-- **0001**: E2E flow control (TX ring) vendor workaround
-- **0003/v2**: DMA path teardown order fix
-- **0004/v2**: Clamp DMA tunnel credits to register capacity
-- **0006**: Use min() for DMA path credit cap
-- **0009/v3**: Release Rx HopID on allocation mismatch
-- **0010/v3**: Mark connection down when bring-up fails
-- **0011**: Report DMA path teardown failures to caller
-- **0012/v2**: Handle ASM4242 pending bit that never clears
+- **0001**: E2E flow control (TX ring) — ✅ merged into Linus's mainline
+- **0003/v2**: DMA path teardown order fix — ✅ merged into Linus's mainline
+- **0004/v2**: Clamp DMA tunnel credits to register capacity — in maintainer's `next`, awaiting merge window
+- **0006**: Use min() for DMA path credit cap — same as above
+- **0007**: Fix tbnet Rx statistics (frames miscounted as packets) — submitted, has a reviewer's Reviewed-by
+- **0009/v3**: Release Rx HopID on allocation mismatch — ✅ merged into the netdev tree
+- **0010/v3**: Mark connection down when bring-up fails — ✅ merged into the netdev tree
+- **0011**: Report DMA path teardown failures to caller — ❌ abandoned, will not be submitted
+- **0012/v3**: Handle ASM4242 pending bit that never clears — submitted, awaiting review
 
-> **Important**: Patches are independent, solve different problems, can be applied in any order.
+> **Important**: Patches are independent, solve different problems, can be applied in
+> any order. See each section below for details; upstream status changes over time,
+> trust the "Status" line in each section over this summary.
 
 ---
 
@@ -194,7 +255,9 @@ Multiple defects found on this hardware, with corresponding patches:
 **Issue**: Upstream adds `RING_FLAG_E2E` to TX ring. Per USB4 spec, enabling E2E on TX requires end-to-end credits before sending;
 but ASM4242 **never generates E2E credits** → TX consumer permanently stalled, large flows cannot pass.
 
-**Status**: The upstream commit is correct on Intel; this is ASMedia-specific workaround, upstream unlikely to merge, local use only.
+**Status**: ✅ Accepted upstream — merged into `net-next` by netdev maintainer
+Jakub Kicinski on 2026-07-30 (commit `1881f2efbf7f`, `Acked-by: Mika Westerberg`),
+now in Linus's `master`.
 
 ---
 
@@ -214,6 +277,9 @@ but ASM4242 **never generates E2E credits** → TX consumer permanently stalled,
 
 **Verification**: Apply only this patch on clean v6.17 tree, teardown time drops from 0.503s to 0.003s.
 
+**Status**: ✅ Accepted upstream (`Acked-by: Mika Westerberg`), now in Linus's
+`master` (commit `68bf02b6b4ad`).
+
 ---
 
 ## 0004/v2 — Clamp DMA Tunnel Credits
@@ -230,6 +296,10 @@ but ASM4242 **never generates E2E credits** → TX consumer permanently stalled,
 
 **Test**: ASM4242 reports 174 buffers, requesting 172 credits: before fix reads 44 (172 & 0x7f), after fix reads 127.
 
+**Status**: Applied directly by thunderbolt maintainer Mika Westerberg into his
+`next` branch (commit `86feaba911f2`), tagged `thunderbolt-for-v7.3-rc1`,
+awaiting the next kernel merge window to reach Linus's mainline.
+
 ---
 
 ## 0006 — Use min() for Credit Cap
@@ -237,6 +307,35 @@ but ASM4242 **never generates E2E credits** → TX consumer permanently stalled,
 **File**: `0006-thunderbolt-Use-min-for-the-DMA-path-credit-cap.patch`
 
 **Note**: Simplify credit cap calculation using min() function.
+
+**Status**: Landed in the maintainer's `next` branch in the same batch as
+0004/v2 (commit `e8158c8a6a23`), same merge-window wait.
+
+---
+
+## 0007 — Fix tbnet Rx Statistics
+
+**File**: `0007-net-thunderbolt-Count-delivered-packets-in-rx_packe.patch`
+
+**Issue**:
+
+- `rx_packets` increments once per received **frame**, but a logical packet
+  is split across multiple frames once MTU exceeds the per-frame payload
+  limit (`TBNET_MAX_PAYLOAD_SIZE`)
+- So `rx_packets` actually counts frames, and `rx_bytes` includes partial
+  packets that may later be dropped during reassembly
+- At MTU 65330, the receiver reports about 16x the packet count the sender
+  actually sent
+
+**Fix**: Move the counting to the point where a packet is fully reassembled
+and handed to the network stack.
+
+**Test**: `rx_packets` vs. peer `InReceives` ratio dropped from 15.899 to
+0.992; `rx_bytes/rx_packets` recovered from 4083.9 (frame size) to 65308.3
+(actual packet size).
+
+**Status**: Submitted, received `Reviewed-by` from Simon Horman, not yet
+merged by the maintainer.
 
 ---
 
@@ -254,6 +353,10 @@ but ASM4242 **never generates E2E credits** → TX consumer permanently stalled,
 
 **Fixes**: `180b0689425c` ("thunderbolt: Allow multiple DMA tunnels over a single XDomain connection")
 
+**Status**: ✅ Merged by netdev maintainer Jakub Kicinski into `net.git`/`net-next.git`
+`main` (2026-08-17, commit `2f1463554d05`, `Acked-by: Mika Westerberg` +
+`Reviewed-by: Simon Horman`), not yet in Linus's `master`.
+
 ---
 
 ## 0010/v3 — Mark Connection Down
@@ -270,11 +373,16 @@ but ASM4242 **never generates E2E credits** → TX consumer permanently stalled,
 
 **Fixes**: `e69b6c02b4c3` ("net: Add support for networking over Thunderbolt cable")
 
+**Status**: ✅ Merged by netdev maintainer Jakub Kicinski into `net.git`/`net-next.git`
+`main` (2026-08-17, commit `3c8b26ebf525`, `Acked-by: Mika Westerberg` +
+`Reviewed-by: Simon Horman`), not yet in Linus's `master`.
+
 ---
 
-## 0011 — Report Teardown Failures
+## 0011 — Report Teardown Failures (Abandoned)
 
-**File**: `0011-thunderbolt-Report-DMA-path-teardown-failures-to-the.patch`
+**File**: `0011-ABANDONED-v2-thunderbolt-Report-DMA-path-teardown-fai.patch`
+(kept for reference, do not submit)
 
 **Issue**:
 
@@ -289,11 +397,18 @@ but ASM4242 **never generates E2E credits** → TX consumer permanently stalled,
 - Teardown still runs to completion (paths marked inactive, credits released, tunnel freed)
 - Only changes return value; callers that check it now get truth
 
+**Status**: ❌ Abandoned, will not be submitted — the same return value means
+different things on ICM vs. the software connection manager (non-zero means
+"tunnel may still be up" on one, "tunnel torn down, one hop just didn't
+drain" on the other), and the public header only gives the caller an opaque
+pointer with no way to tell which one it's talking to, so no consistent
+contract could be given.
+
 ---
 
-## 0012/v2 — ASM4242 Pending Bit Quirk
+## 0012/v3 — ASM4242 Pending Bit Quirk
 
-**File**: `0012-v2-thunderbolt-Stop-waiting-on-a-path-pending-bit-tha.patch`
+**File**: `0012-v3-thunderbolt-Stop-waiting-on-a-path-pending-bit-tha.patch`
 
 **Issue**:
 
@@ -307,7 +422,20 @@ but ASM4242 **never generates E2E credits** → TX consumer permanently stalled,
 - Ring size determines frame threshold (ring 128 ~120 frames, ring 256 ~260 frames)
 - Other hops clear normally, only host adapter affected
 
-**Fix**: Add quirk for ASM4242 to skip pending bit wait on this special host adapter.
+**Fix (v3)**: Turn the 500ms wait into a property of the host router itself,
+quirked to 0 for ASM4242 (`1b21:2425`) — the loop still reads the bit once:
+a drained hop reports drained on that read, a stuck one returns
+`-ETIMEDOUT` immediately instead of waiting the full 500ms. v2 skipped the
+check globally; v3 narrows it to a per-hardware-ID quirk.
+
+**Status**: Submitted (v3). Design and implementation details were agreed
+with the maintainer (Mika Westerberg) by email and got a "Sounds good".
+He noted his `next` branch is frozen for the current release cycle and he
+won't start picking up queued patches again until after the next kernel
+release ships — v3 was sent early, on purpose, to be ready and waiting;
+the current lack of review activity is the expected state, not neglect.
+Previous version (v2) is deprecated, don't
+use it.
 
 ---
 
@@ -321,10 +449,11 @@ All patches are independent:
 | 0003/v2 | None | Any |
 | 0004/v2 | None | Any |
 | 0006 | Optional after 0004 | After 0004 |
+| 0007 | None | Any |
 | 0009/v3 | None | Any |
 | 0010/v3 | Requires 0009/v3 | After 0009 |
-| 0011 | None | Any |
-| 0012/v2 | None | Any |
+| 0011 | None (abandoned, not submitted) | — |
+| 0012/v3 | None | Any |
 
 ---
 
@@ -335,18 +464,22 @@ All patches are independent:
 ### 概要
 
 ASMedia ASM4242 USB4 でホスト間に直接接続された 2 台のマシンで `thunderbolt-net` を実行。
-このハードウェアで複数の欠陥を発見し、対応するパッチを用意しました:
+このハードウェアで複数の欠陥を発見し、対応するパッチを用意しました
+(2026-08-19 時点のステータス):
 
-- **0001**: E2E フロー制御(TX リング)ベンダー回避策
-- **0003/v2**: DMA パス破棄順序の修正
-- **0004/v2**: DMA トンネルクレジットをレジスタ容量に制限
-- **0006**: DMA パスクレジット上限に min() を使用
-- **0009/v3**: 割り当てミスマッチ時の Rx HopID を解放
-- **0010/v3**: ブリングアップ失敗時に接続を down にマーク
-- **0011**: DMA パス破棄失敗を呼び出し者に報告
-- **0012/v2**: クリアされない ASM4242 pending bit に対応
+- **0001**: E2E フロー制御(TX リング)—— ✅ Linus のメインラインに合流済み
+- **0003/v2**: DMA パス破棄順序の修正 —— ✅ Linus のメインラインに合流済み
+- **0004/v2**: DMA トンネルクレジットをレジスタ容量に制限 —— メンテナの `next` に入り、マージウィンドウ待ち
+- **0006**: DMA パスクレジット上限に min() を使用 —— 同上
+- **0007**: tbnet 受信統計の修正(フレーム数をパケット数と誤カウント)—— 提出済み、レビュアーの Reviewed-by 獲得
+- **0009/v3**: 割り当てミスマッチ時の Rx HopID を解放 —— ✅ netdev ツリーに合流済み
+- **0010/v3**: ブリングアップ失敗時に接続を down にマーク —— ✅ netdev ツリーに合流済み
+- **0011**: DMA パス破棄失敗を呼び出し者に報告 —— ❌ 放棄、提出しません
+- **0012/v3**: クリアされない ASM4242 pending bit に対応 —— 提出済み、レビュー待ち
 
 > **重要**: パッチは独立しており、異なる問題を解決し、任意の順序で適用できます。
+> 詳細は各セクションを参照してください。アップストリームの状況は時間とともに
+> 変化するため、この要約より各セクションの「ステータス」行を優先してください。
 
 ---
 
@@ -357,7 +490,9 @@ ASMedia ASM4242 USB4 でホスト間に直接接続された 2 台のマシン�
 **問題**: アップストリームが `RING_FLAG_E2E` を TX リングにも追加します。USB4 仕様によれば、TX リングで E2E を有効にするには送信前にエンドツーエンドクレジットを取得する必要があります。
 しかし ASM4242 は **E2E クレジットを生成しない** → TX コンシューマが永続的に停止、大きなフローが通過できません。
 
-**ステータス**: アップストリームコミットは Intel では正しく、これは ASMedia 固有の回避策で、アップストリームではマージされない可能性があり、ローカル使用のみです。
+**ステータス**: ✅ アップストリームに採用済み —— 2026-07-30 に netdev メンテナ
+Jakub Kicinski により `net-next` に取り込まれ(commit `1881f2efbf7f`、
+`Acked-by: Mika Westerberg`)、現在は Linus の `master` に入っています。
 
 ---
 
@@ -377,6 +512,9 @@ ASMedia ASM4242 USB4 でホスト間に直接接続された 2 台のマシン�
 
 **検証**: クリーンな v6.17 ツリーでこのパッチのみを適用すると、破棄時間は 0.503s から 0.003s に短縮されます。
 
+**ステータス**: ✅ アップストリームに採用済み(`Acked-by: Mika Westerberg`)、
+現在 Linus の `master` に入っています(commit `68bf02b6b4ad`)。
+
 ---
 
 ## 0004/v2 — DMA トンネルクレジットを制限
@@ -393,6 +531,10 @@ ASMedia ASM4242 USB4 でホスト間に直接接続された 2 台のマシン�
 
 **テスト**: ASM4242 は 174 バッファを報告、172 クレジットをリクエスト: 修正前は 44(172 & 0x7f)を読み取り、修正後は 127 を読み取ります。
 
+**ステータス**: thunderbolt メンテナ Mika Westerberg により彼の `next` ブランチに
+直接取り込まれ(commit `86feaba911f2`)、`thunderbolt-for-v7.3-rc1` としてタグ
+付け済み、次のマージウィンドウで Linus のメインラインに入るのを待っています。
+
 ---
 
 ## 0006 — min() を使用してクレジット上限を計算
@@ -400,6 +542,34 @@ ASMedia ASM4242 USB4 でホスト間に直接接続された 2 台のマシン�
 **ファイル**: `0006-thunderbolt-Use-min-for-the-DMA-path-credit-cap.patch`
 
 **注記**: min() 関数を使用してクレジット上限計算を簡略化します。
+
+**ステータス**: 0004/v2 と同時にメンテナの `next` ブランチに取り込まれ
+(commit `e8158c8a6a23`)、同様にマージウィンドウ待ちです。
+
+---
+
+## 0007 — tbnet 受信統計の修正
+
+**ファイル**: `0007-net-thunderbolt-Count-delivered-packets-in-rx_packe.patch`
+
+**問題**:
+
+- `rx_packets` は受信した**フレーム**ごとに加算されるが、MTU がフレームあたりの
+  ペイロード上限(`TBNET_MAX_PAYLOAD_SIZE`)を超えると 1 つの論理パケットが
+  複数フレームに分割される
+- そのため `rx_packets` は実質フレーム数を数えており、`rx_bytes` も後で破棄され
+  得る未完成のパケットを含んでしまう
+- MTU 65330 では、受信側が送信側の約 16 倍のパケット数を報告する
+
+**修正**: パケットが完全に再構築されプロトコルスタックに渡される時点で
+カウントするように変更。
+
+**テスト**: `rx_packets` と対向の `InReceives` の比が 15.899 から 0.992 に改善、
+`rx_bytes/rx_packets` が 4083.9(フレームサイズ)から 65308.3(実際のパケット
+サイズ)に回復。
+
+**ステータス**: 提出済み、Simon Horman から `Reviewed-by` を獲得、メンテナに
+よるマージはまだ。
 
 ---
 
@@ -417,6 +587,11 @@ ASMedia ASM4242 USB4 でホスト間に直接接続された 2 台のマシン�
 
 **修正対象**: `180b0689425c` ("thunderbolt: Allow multiple DMA tunnels over a single XDomain connection")
 
+**ステータス**: ✅ netdev メンテナ Jakub Kicinski により `net.git`/`net-next.git`
+の `main` に取り込まれ済み(2026-08-17、commit `2f1463554d05`、
+`Acked-by: Mika Westerberg` + `Reviewed-by: Simon Horman`)、Linus の `master`
+にはまだ入っていません。
+
 ---
 
 ## 0010/v3 — 接続を down にマーク
@@ -433,11 +608,17 @@ ASMedia ASM4242 USB4 でホスト間に直接接続された 2 台のマシン�
 
 **修正対象**: `e69b6c02b4c3` ("net: Add support for networking over Thunderbolt cable")
 
+**ステータス**: ✅ netdev メンテナ Jakub Kicinski により `net.git`/`net-next.git`
+の `main` に取り込まれ済み(2026-08-17、commit `3c8b26ebf525`、
+`Acked-by: Mika Westerberg` + `Reviewed-by: Simon Horman`)、Linus の `master`
+にはまだ入っていません。
+
 ---
 
-## 0011 — 破棄失敗を報告
+## 0011 — 破棄失敗を報告(放棄)
 
-**ファイル**: `0011-thunderbolt-Report-DMA-path-teardown-failures-to-the.patch`
+**ファイル**: `0011-ABANDONED-v2-thunderbolt-Report-DMA-path-teardown-fai.patch`
+(記録として保持、提出しないこと)
 
 **問題**:
 
@@ -452,11 +633,17 @@ ASMedia ASM4242 USB4 でホスト間に直接接続された 2 台のマシン�
 - 破棄は依然として完了まで実行されます(パスは inactive にマーク、クレジット解放、トンネル解放)
 - 戻り値のみが変わり、チェックする呼び出し元は真実を取得します
 
+**ステータス**: ❌ 放棄——提出しません。ICM とソフトウェア接続マネージャで
+同じ戻り値の意味が異なり(片方では非 0 が「トンネルがまだ生きている可能性」、
+もう片方では「トンネルは破棄済みで、1 つの hop が排水できなかっただけ」を
+意味する)、公開ヘッダは呼び出し側に不透明なポインタしか渡さないため、
+どちらと通信しているか区別できず、一貫した契約を提供できません。
+
 ---
 
-## 0012/v2 — ASM4242 Pending Bit Quirk
+## 0012/v3 — ASM4242 Pending Bit Quirk
 
-**ファイル**: `0012-v2-thunderbolt-Stop-waiting-on-a-path-pending-bit-tha.patch`
+**ファイル**: `0012-v3-thunderbolt-Stop-waiting-on-a-path-pending-bit-tha.patch`
 
 **問題**:
 
@@ -470,7 +657,20 @@ ASMedia ASM4242 USB4 でホスト間に直接接続された 2 台のマシン�
 - リングサイズがフレームしきい値を決定します(リング 128 ~120 フレーム、リング 256 ~260 フレーム)
 - 他の hop は正常にクリアされ、host adapter のみが影響を受けます
 
-**修正**: ASM4242 の quirk を追加して、この特別な host adapter での pending ビット待機をスキップします。
+**修正(v3)**: 500ms の待機を host router 自身のプロパティにし、ASM4242
+(`1b21:2425`)には quirk で 0 を設定——ループは依然として 1 回はビットを
+読みます:排水済みの hop はその 1 回で排水済みと報告され、詰まっている
+hop はフルの 500ms を待たずに即座に `-ETIMEDOUT` を返します。v2 は
+チェックを全体でスキップしていましたが、v3 はハードウェア ID 単位の
+quirk に絞り込みました。
+
+**ステータス**: 提出済み(v3)。設計と実装の詳細はメールでメンテナ
+(Mika Westerberg)と合意済みで、"Sounds good" の返答を得ています。
+メンテナによれば、彼の `next` ブランチは今期リリースサイクル分で
+凍結済みで、次のカーネルリリース後でないとキューのパッチを拾い始め
+ないとのこと —— v3 はそれを見越して意図的に早めに送って待機させている
+もので、現在レビュー動きがないのは想定どおりであり、放置されている
+わけではありません。旧版(v2)は非推奨のため使用しないこと。
 
 ---
 
@@ -484,7 +684,8 @@ ASMedia ASM4242 USB4 でホスト間に直接接続された 2 台のマシン�
 | 0003/v2 | なし | 任意 |
 | 0004/v2 | なし | 任意 |
 | 0006 | 0004 の後で依存 | 0004 の後 |
+| 0007 | なし | 任意 |
 | 0009/v3 | なし | 任意 |
 | 0010/v3 | 0009/v3 が必須 | 0009 の後 |
-| 0011 | なし | 任意 |
-| 0012/v2 | なし | 任意 |
+| 0011 | なし(放棄、提出しない) | — |
+| 0012/v3 | なし | 任意 |

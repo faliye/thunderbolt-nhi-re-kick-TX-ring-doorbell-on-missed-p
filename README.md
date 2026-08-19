@@ -34,11 +34,11 @@ not a packaged project, no support implied.
   handful of DMA-credit values.
 - `patches/` — upstream Thunderbolt/USB4 kernel patches (from LKML) used as
   a reference/cherry-pick set while building a testing kernel.
-- `upstream-patches/` — an original patch: `thunderbolt: nhi: re-kick TX ring
-  doorbell on missed producer update`. Fixes a spurious ~200ms stall on a
-  small fraction of tbnet round trips, caused by the ASM4242 USB4 host
-  router occasionally not acting on a TX ring doorbell write. Not yet sent
-  upstream.
+- `upstream-patches/` — a set of original kernel patches found while
+  chasing throughput and stability issues on this ASM4242 link (DMA credit
+  clamping, DMA path teardown ordering, an Rx HopID leak, Rx stats
+  accounting, and more). Several have already been accepted upstream; see
+  `upstream-patches/README.md` for the current status of each.
 
 ### Status
 
@@ -71,9 +71,9 @@ GPL-2.0-only, matching the licensing of the kernel sources they target.
 - `monitor*.log` — 在几个不同 DMA 信用值下观察链路重新协商的样例输出。
 - `patches/` — 来自 LKML 的上游 Thunderbolt/USB4 内核补丁,构建测试内核时作为参考
   / cherry-pick 集合使用。
-- `upstream-patches/` — 一个原创补丁:`thunderbolt: nhi: re-kick TX ring doorbell
-  on missed producer update`。修复了 ASM4242 USB4 主控芯片偶尔不响应 TX 环形缓冲区
-  门铃写入,导致极小比例的 tbnet 往返出现约 200ms 虚假停顿的问题。尚未提交上游。
+- `upstream-patches/` — 一组在这条 ASM4242 链路上排查吞吐与稳定性问题时发现的
+  原创内核补丁(DMA 信用钳位、DMA 路径拆除顺序、Rx HopID 泄漏、接收统计计数等)。
+  其中多个已被上游接受,逐补丁的当前状态见 `upstream-patches/README.md`。
 
 ### 状态
 
@@ -109,10 +109,11 @@ GPL-2.0-only, matching the licensing of the kernel sources they target.
   観察したサンプル出力。
 - `patches/` — テスト用カーネルをビルドする際の参考/cherry-pick 用として使った、
   LKML 由来の上流 Thunderbolt/USB4 カーネルパッチ。
-- `upstream-patches/` — オリジナルのパッチ:`thunderbolt: nhi: re-kick TX ring
-  doorbell on missed producer update`。ASM4242 USB4 ホストルーターが TX リング
-  のドアベル書き込みに対して稀に反応しないことが原因で、tbnet の往復通信のごく
-  一部に約 200ms の疑似スタントが発生する問題を修正します。上流にはまだ未送信です。
+- `upstream-patches/` — この ASM4242 リンクでスループットと安定性の問題を調査
+  する中で見つかったオリジナルのカーネルパッチ一式(DMA クレジットのクランプ、
+  DMA パス破棄順序、Rx HopID リーク、受信統計カウントなど)。すでに複数が
+  上流に受理されており、各パッチの現在の状態は `upstream-patches/README.md`
+  を参照してください。
 
 ### ステータス
 
