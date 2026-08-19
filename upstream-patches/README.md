@@ -19,7 +19,7 @@
 - **0009/v3**: 释放 Rx HopID 不匹配时分配的 ID —— ✅ 已合入 netdev 树
 - **0010/v3**: 设置连接状态为 down 当建立失败时 —— ✅ 已合入 netdev 树
 - **0011**: 向调用者报告 DMA 路径拆除失败 —— ❌ 已放弃,不会提交
-- **0012/v3**: 处理 ASM4242 pending bit 不清零的特性 —— 已提交,等待评审
+- **0012/v3**: 处理 ASM4242 pending bit 不清零的特性 —— Acked by Mika
 
 > **重要**: 各补丁相互独立,解决不同问题,可按任意顺序应用。逐条详情见下文,
 > 上游落地状态会随时间变化,请以各节的「状态」行为准。
@@ -198,9 +198,7 @@
 quirk,粒度更细。
 
 **状态**: 已提交(v3),设计与实现细节已在邮件里和维护者(Mika Westerberg)谈妥
-并获认可("Sounds good")。维护者说明他的 `next` 分支已为当前发布周期冻结,
-要等下一个版本发布后才会开始处理排队的补丁——v3 就是照此有意提前发出、排队
-等待的,当前的"无评审动态"是预期状态,不是被忽略。上一版(v2)已废弃,不要再用。
+并获认可("Sounds good")。Acked by Mika。
 
 ---
 
@@ -240,7 +238,7 @@ Multiple defects found on this hardware, with corresponding patches
 - **0009/v3**: Release Rx HopID on allocation mismatch — ✅ merged into the netdev tree
 - **0010/v3**: Mark connection down when bring-up fails — ✅ merged into the netdev tree
 - **0011**: Report DMA path teardown failures to caller — ❌ abandoned, will not be submitted
-- **0012/v3**: Handle ASM4242 pending bit that never clears — submitted, awaiting review
+- **0012/v3**: Handle ASM4242 pending bit that never clears — submitted, Acked by Mika
 
 > **Important**: Patches are independent, solve different problems, can be applied in
 > any order. See each section below for details; upstream status changes over time,
@@ -428,12 +426,9 @@ a drained hop reports drained on that read, a stuck one returns
 `-ETIMEDOUT` immediately instead of waiting the full 500ms. v2 skipped the
 check globally; v3 narrows it to a per-hardware-ID quirk.
 
-**Status**: Submitted (v3). Design and implementation details were agreed
-with the maintainer (Mika Westerberg) by email and got a "Sounds good".
-He noted his `next` branch is frozen for the current release cycle and he
-won't start picking up queued patches again until after the next kernel
-release ships — v3 was sent early, on purpose, to be ready and waiting;
+**Status**: v3 was sent early, on purpose, to be ready and waiting;
 the current lack of review activity is the expected state, not neglect.
+Acked by Mika.
 Previous version (v2) is deprecated, don't
 use it.
 
@@ -475,7 +470,7 @@ ASMedia ASM4242 USB4 でホスト間に直接接続された 2 台のマシン�
 - **0009/v3**: 割り当てミスマッチ時の Rx HopID を解放 —— ✅ netdev ツリーに合流済み
 - **0010/v3**: ブリングアップ失敗時に接続を down にマーク —— ✅ netdev ツリーに合流済み
 - **0011**: DMA パス破棄失敗を呼び出し者に報告 —— ❌ 放棄、提出しません
-- **0012/v3**: クリアされない ASM4242 pending bit に対応 —— 提出済み、レビュー待ち
+- **0012/v3**: クリアされない ASM4242 pending bit に対応 —— 提出済み、Acked by Mika.
 
 > **重要**: パッチは独立しており、異なる問題を解決し、任意の順序で適用できます。
 > 詳細は各セクションを参照してください。アップストリームの状況は時間とともに
@@ -664,11 +659,7 @@ hop はフルの 500ms を待たずに即座に `-ETIMEDOUT` を返します。v
 チェックを全体でスキップしていましたが、v3 はハードウェア ID 単位の
 quirk に絞り込みました。
 
-**ステータス**: 提出済み(v3)。設計と実装の詳細はメールでメンテナ
-(Mika Westerberg)と合意済みで、"Sounds good" の返答を得ています。
-メンテナによれば、彼の `next` ブランチは今期リリースサイクル分で
-凍結済みで、次のカーネルリリース後でないとキューのパッチを拾い始め
-ないとのこと —— v3 はそれを見越して意図的に早めに送って待機させている
+**ステータス**: 提出済み(v3)。Acked by Mika. v3 はそれを見越して意図的に早めに送って待機させている
 もので、現在レビュー動きがないのは想定どおりであり、放置されている
 わけではありません。旧版(v2)は非推奨のため使用しないこと。
 
